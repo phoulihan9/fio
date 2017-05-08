@@ -20,6 +20,8 @@
 #include "filelock.h"
 #include "smalloc.h"
 
+int fio_io_sync(struct thread_data *td, struct fio_file *f);
+
 static int iolog_flush(struct io_log *log);
 
 static const char iolog_ver2[] = "fio version 2 iolog";
@@ -121,6 +123,12 @@ static int ipo_special(struct thread_data *td, struct io_piece *ipo)
 		return -1;
 	case FIO_LOG_CLOSE_FILE:
 		td_io_close_file(td, f);
+		// If iodepth > 1 then close might be deferred til last I/O completes
+		// Need to sync and invalidate as might be re-opening on next ipo
+		if (fio_io_sync(td, f))
+			return -1;
+		if (file_invalidate_cache(td, f))
+			return -1;
 		break;
 	case FIO_LOG_UNLINK_FILE:
 		td_io_unlink_file(td, f);
@@ -219,11 +227,14 @@ void log_io_piece(struct thread_data *td, struct io_u *io_u)
 	ipo->flags = IP_F_IN_FLIGHT;
 
 	io_u->ipo = ipo;
+	assert(ddir_rw(io_u->ddir));
 
 	if (io_u_should_trim(td, io_u)) {
 		flist_add_tail(&ipo->trim_list, &td->trim_list);
 		td->trim_entries++;
-	}
+	} else if (io_u->ddir == DDIR_TRIM) {
+		ipo->flags |= IP_F_TRIM_VER;
+	} else ipo->flags |= IP_F_WRITE_VER;
 
 	/*
 	 * We don't need to sort the entries, if:
@@ -724,7 +735,7 @@ static void flush_hist_samples(FILE *f, int hist_coarseness, void *samples,
 	unsigned int *io_u_plat_before;
 
 	int stride = 1 << hist_coarseness;
-	
+
 	if (!sample_size)
 		return;
 
@@ -1086,13 +1097,13 @@ void flush_log(struct io_log *log, bool do_append)
 
 		cur_log = flist_first_entry(&log->io_logs, struct io_logs, list);
 		flist_del_init(&cur_log->list);
-		
+
 		if (log->td && log == log->td->clat_hist_log)
 			flush_hist_samples(f, log->hist_coarseness, cur_log->log,
 			                   log_sample_sz(log, cur_log));
 		else
 			flush_samples(f, cur_log->log, log_sample_sz(log, cur_log));
-		
+
 		sfree(cur_log);
 	}
 

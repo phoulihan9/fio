@@ -1386,6 +1386,37 @@ static int str_size_cb(void *data, unsigned long long *__val)
 	return 0;
 }
 
+static int str_tracking_dir_cb(void *data, const char fio_unused *unused)
+{
+	struct thread_data *td = data;
+	struct stat sb;
+	char *dirname, *str, *p;
+	int ret = 0;
+
+	if (parse_dryrun())
+		return 0;
+
+	p = str = strdup(td->o.verify_track_dir);
+	while ((dirname = get_next_name(&str)) != NULL) {
+		if (lstat(dirname, &sb) < 0) {
+			ret = errno;
+
+			log_err("fio: %s is not a directory\n", dirname);
+			td_verror(td, ret, "lstat");
+			goto out;
+		}
+		if (!S_ISDIR(sb.st_mode)) {
+			log_err("fio: %s is not a directory\n", dirname);
+			ret = 1;
+			goto out;
+		}
+	}
+
+out:
+	free(p);
+	return ret;
+}
+
 static int str_write_bw_log_cb(void *data, const char *str)
 {
 	struct thread_data *td = cb_data_to_td(data);
@@ -1439,7 +1470,11 @@ static int rw_verify(struct fio_option *o, void *data)
 			" read-only mode\n", td->o.name);
 		return 1;
 	}
-
+	if (read_only && td_trim(td)) {
+		log_err("fio: job <%s> has trim bit set, but fio is in"
+				" read-only mode\n", td->o.name);
+		return 1;
+	}
 	return 0;
 }
 
@@ -1608,19 +1643,47 @@ struct fio_option fio_options[FIO_MAX_OPTS] = {
 			  },
 			  { .ival = "rw",
 			    .oval = TD_DDIR_RW,
-			    .help = "Sequential read and write mix",
+			    .help = "Sequential read or write mix",
 			  },
 			  { .ival = "readwrite",
 			    .oval = TD_DDIR_RW,
-			    .help = "Sequential read and write mix",
+			    .help = "Sequential read or write mix",
 			  },
 			  { .ival = "randrw",
 			    .oval = TD_DDIR_RANDRW,
-			    .help = "Random read and write mix"
+			    .help = "Random read or write mix"
 			  },
 			  { .ival = "trimwrite",
 			    .oval = TD_DDIR_TRIMWRITE,
-			    .help = "Trim and write mix, trims preceding writes"
+				.help = "Sequential trim then write, trim preceding write on each block"
+			  },
+			  { .ival = "writetrim",
+				.oval = TD_DDIR_WRITETRIM,
+				.help = "Sequential mixed write or trim, each block will be trimmed or written"
+			  },
+			  { .ival = "randwritetrim",
+				.oval = TD_DDIR_RANDWRITETRIM,
+				.help = "Random mixed write or trim"
+			  },
+			  { .ival = "readtrim",
+				.oval = TD_DDIR_READTRIM,
+				.help = "Sequential mixed read or trim"
+			  },
+			  { .ival = "randreadtrim",
+				.oval = TD_DDIR_RANDREADTRIM,
+				.help = "Random mixed read or trim"
+			  },
+			  { .ival = "readwritetrim",
+				.oval = TD_DDIR_RWT,
+				.help = "Sequential mixed reads/writes/trims"
+			  },
+			  { .ival = "rwt",
+				.oval = TD_DDIR_RWT,
+				.help = "Sequential mixed reads/writes/trims"
+			  },
+			  { .ival = "randrwt",
+				.oval = TD_DDIR_RANDRWT,
+				.help = "Random mixed reads/writes/trims"
 			  },
 		},
 	},
@@ -2897,6 +2960,64 @@ struct fio_option fio_options[FIO_MAX_OPTS] = {
 		.category = FIO_OPT_C_IO,
 		.group	= FIO_OPT_G_VERIFY,
 	},
+	{
+		.name	= "verify_track",
+		.lname	= "Verify tracking",
+		.type	= FIO_OPT_BOOL,
+		.off1	= offsetof(struct thread_options, verify_track),
+		.help	= "Perform verify checksum tracking",
+		.def	= "0",
+		.parent = "verify",
+		.hide	= 1,
+		.category = FIO_OPT_C_IO,
+		.group	= FIO_OPT_G_VERIFY,
+	},
+	{
+		.name	= "verify_track_log",
+		.lname	= "Verify tracking log",
+		.type	= FIO_OPT_BOOL,
+		.off1	= offsetof(struct thread_options, verify_track_log),
+		.help	= "Create verify checksum tracking log",
+		.def	= "0",
+		.parent = "verify",
+		.hide	= 1,
+		.category = FIO_OPT_C_IO,
+		.group	= FIO_OPT_G_VERIFY,
+	},
+	{
+		.name	= "verify_track_required",
+		.lname	= "Verify tracking log required",
+		.type	= FIO_OPT_BOOL,
+		.off1	= offsetof(struct thread_options, verify_track_required),
+		.help	= "Verify checksum tracking log required",
+		.def	= "0",
+		.parent = "verify",
+		.hide	= 1,
+		.category = FIO_OPT_C_IO,
+		.group	= FIO_OPT_G_VERIFY,
+	},
+	{
+		.name	= "verify_track_dir",
+		.lname	= "Verify tracking_dir",
+		.type	= FIO_OPT_STR_STORE,
+		.off1	= offsetof(struct thread_options, verify_track_dir),
+		.cb	= str_tracking_dir_cb,
+		.help	= "Defines verify checksum tracking log directory",
+		.category = FIO_OPT_C_IO,
+		.group	= FIO_OPT_G_VERIFY,
+	},
+	{
+		.name	= "verify_track_trim_zero",
+		.lname	= "Verify trim zeroes block",
+		.type	= FIO_OPT_BOOL,
+		.off1	= offsetof(struct thread_options, verify_track_trim_zero),
+		.help	= "Verify trim zeroes block",
+		.def	= "0",
+		.parent = "verify",
+		.hide	= 1,
+		.category = FIO_OPT_C_IO,
+		.group	= FIO_OPT_G_VERIFY,
+	},
 #ifdef FIO_HAVE_TRIM
 	{
 		.name	= "trim_percentage",
@@ -2905,7 +3026,7 @@ struct fio_option fio_options[FIO_MAX_OPTS] = {
 		.off1	= offsetof(struct thread_options, trim_percentage),
 		.minval = 0,
 		.maxval = 100,
-		.help	= "Number of verify blocks to trim (i.e., discard)",
+		.help	= "Percentage of written verify blocks to discard/trim.",
 		.parent	= "verify",
 		.def	= "0",
 		.interval = 1,
@@ -3143,6 +3264,21 @@ struct fio_option fio_options[FIO_MAX_OPTS] = {
 		.def	= "50",
 		.interval = 5,
 		.inverse = "rwmixread",
+		.category = FIO_OPT_C_IO,
+		.group	= FIO_OPT_G_RWMIX,
+	},
+	{
+		.name	= "rwtmix",
+		.lname	= "Percentage of mixed workloads for read,writes,trims",
+		.alias	= "",
+		.type	= FIO_OPT_INT,
+		.off1	= offsetof(struct thread_options, rwmix[DDIR_READ]),
+		.off2	= offsetof(struct thread_options, rwmix[DDIR_WRITE]),
+		.off3	= offsetof(struct thread_options, rwmix[DDIR_TRIM]),
+		.maxval	= 100,
+		.help	= "Percentage of mixed workloads for read,writes,trims",
+		.hide	= 1,
+		.interval = 5,
 		.category = FIO_OPT_C_IO,
 		.group	= FIO_OPT_G_RWMIX,
 	},

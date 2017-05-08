@@ -344,27 +344,60 @@ Sequential reads.
 .B write
 Sequential writes.
 .TP
-.B trim
-Sequential trims (Linux block devices only).
-.TP
 .B randread
 Random reads.
 .TP
 .B randwrite
 Random writes.
 .TP
-.B randtrim
-Random trims (Linux block devices only).
-.TP
 .B rw, readwrite
-Mixed sequential reads and writes.
+Mixed sequential read or write.
 .TP
 .B randrw
-Mixed random reads and writes.
+Mixed random read or write.
+.RE
+.RS
+.P
+Trim I/O has several requirements:
+.RS
+ - File system and OS support varies but Linux block devices accept trims.
+   You need privilege to write to a Linux block device.
+   See example fio: track-mem.fio
+ - Often minimal block size required. Linux on VMware requires 1 MB
+ - VMware requires minimum VM OS hardware level 11
+ - To verify the trim I/Os requires verify_track
+.RE
+.TP
+Trim I/O patterns are:
+.RE
+.RS
+.TP
+.B trim
+Sequential trim
+.TP
+.B readtrim
+Sequential mixed read or trim
 .TP
 .B trimwrite
-Sequential trim and write mixed workload. Blocks will be trimmed first, then
-the same blocks will be written to.
+Sequential mixed trim then write workload. Each block will be trimmed first, then written to.
+.TP
+.B writetrim
+Sequential mixed write or trim. Each block will be either trimmed or written.
+.TP
+.B rwt, readwritetrim
+Sequential mixed reads/writes/trims
+.TP
+.B randtrim
+Random trim
+.TP
+.B randreadtrim
+Random mixed read or trim
+.TP
+.B randwritetrim
+Random mixed write or trim
+.TP
+.B randrwt
+Random mixed reads/writes/trims
 .RE
 .P
 Fio defaults to read if the option is not specified.
@@ -975,6 +1008,13 @@ overrides the first. This may interfere with a given rate setting, if fio is
 asked to limit reads or writes to a certain rate. If that is the case, then
 the distribution may be skewed. Default: 50.
 .TP
+.BI rwtmix \fR=\fPint[,int][,int]
+Percentage of a mixed workload that should be reads, writes or trims. The three
+percentages must add to 100%. Values for reads, writes, and trims can be specified separately
+in the format \fIread\fR,\fIwrite\fR,\fItrim\fR any of which may be empty
+to leave that value at its default from rwmix* arguments of 50,50,0.
+If a trailing comma isn't given, the remainder will inherit the last value set.
+.TP
 .BI random_distribution \fR=\fPstr:float
 By default, fio will use a completely uniform random distribution when asked
 to perform random IO. Sometimes it is useful to skew the distribution in
@@ -1401,7 +1441,7 @@ workloads that write data, and does not support workloads with the
 \fBtime_based\fR option set.
 .TP
 .BI do_verify \fR=\fPbool
-Run the verify phase after a write phase.  Only valid if \fBverify\fR is set.
+Run the verify phase after a write/trim phase.  Only valid if \fBverify\fR is set.
 Default: true.
 .TP
 .BI verify \fR=\fPstr
@@ -1515,7 +1555,7 @@ read back and verified).  If \fBverify_backlog_batch\fR is less than
 will be verified more than once.
 .TP
 .BI trim_percentage \fR=\fPint
-Number of verify blocks to discard/trim.
+Percentage of written verify blocks to discard/trim.
 .TP
 .BI trim_verify_zero \fR=\fPbool
 Verify that trim/discarded blocks are returned as zeroes.
@@ -1539,6 +1579,25 @@ If a verify termination trigger was used, fio stores the current write
 state of each thread. This can be used at verification time so that fio
 knows how far it should verify. Without this information, fio will run
 a full verification pass, according to the settings in the job file used.
+.TP
+.BI verify_track \fR=\fPbool
+Track checksums in memory on each verify_interval chunk for all reads/writes
+to guarantee absolute data integrity. Prevents regression of block to
+an earlier version that would be undetected by on-disk CRC checks alone.
+.TP
+.BI verify_track_log \fR=\fPbool
+Save each block's checksum in a tracking log over fio data file close and
+reopen to guarantee absolute data integrity. Prevents regression of block to
+an earlier version over fio stop and restart on the same or another system.
+.TP
+.BI verify_track_required \fR=\fPbool
+On start of a fio run, determines if the tracking log must be present.
+.TP
+.BI verify_track_dir \fR=\fPstr
+Defines the directory where tracking logs are stored.
+.TP
+.BI verify_track_trim_zero\fR=\fPbool
+Verify trim zeroes blocks.
 .TP
 .B stonewall "\fR,\fP wait_for_previous"
 Wait for preceding jobs in the job file to exit before starting this one.

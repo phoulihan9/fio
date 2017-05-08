@@ -300,6 +300,7 @@ struct thread_data {
 	 */
 	uint64_t io_issues[DDIR_RWDIR_CNT];
 	uint64_t io_issue_bytes[DDIR_RWDIR_CNT];
+	uint64_t io_issue_verify_bytes;
 	uint64_t loops;
 
 	/*
@@ -485,7 +486,9 @@ extern struct thread_data *threads;
 
 static inline void fio_ro_check(const struct thread_data *td, struct io_u *io_u)
 {
+	// If write or trim make sure it is allowed by rw argument bit being set
 	assert(!(io_u->ddir == DDIR_WRITE && !td_write(td)));
+	assert(!(io_u->ddir == DDIR_TRIM && !td_trim(td)));
 }
 
 #define REAL_MAX_JOBS		4096
@@ -494,7 +497,7 @@ static inline int should_fsync(struct thread_data *td)
 {
 	if (td->last_was_sync)
 		return 0;
-	if (td_write(td) || td->o.override_sync)
+	if (td_write(td) || td_trim(td) || td->o.override_sync)
 		return 1;
 
 	return 0;

@@ -138,12 +138,14 @@ int fio_gf_open_file(struct thread_data *td, struct fio_file *f)
 	struct gf_data *g = td->io_ops_data;
 	struct stat sb = { 0, };
 
-	if (td_write(td)) {
+	if (td_write(td) || td_trim(td)) {
 		if (!read_only)
 			flags = O_RDWR;
+			// TODO if read_only set then flags not set, need else clause?
 	} else if (td_read(td)) {
 		if (!read_only)
 			flags = O_RDWR;
+			// TODO why is read only rw option opening for read/write access?
 		else
 			flags = O_RDONLY;
 	}
@@ -154,7 +156,7 @@ int fio_gf_open_file(struct thread_data *td, struct fio_file *f)
 		flags |= O_SYNC;
 
 	dprint(FD_FILE, "fio file %s open mode %s td rw %s\n", f->file_name,
-	       flags & O_RDONLY ? "ro" : "rw", td_read(td) ? "read" : "write");
+		   flags & O_RDONLY ? "ro" : "rw", ddir_str(td->o.td_ddir));
 	g->fd = glfs_creat(g->fs, f->file_name, flags, 0644);
 	if (!g->fd) {
 		ret = errno;

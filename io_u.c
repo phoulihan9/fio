@@ -342,6 +342,22 @@ static int get_next_rand_block(struct thread_data *td, struct fio_file *f,
 	return 1;
 }
 
+// If multiple I/O types in the workload then can't have fio reading,
+// writing or trimming the same block with independent offsets to the
+// next I/O location/offset as that would be confusing and will not be verifiable.
+// So when last_pos need to be reset, reset all the last position
+// pointers. Trim & write is the one exception to multiple I/O type
+// workloads and operates more like a single I/O type workload.
+static void reset_last_pos(struct thread_data *td, struct fio_file *f,
+						   enum fio_ddir ddir, uint64_t value)
+{
+	if (td_multiple_ddirs(td) && !td_trim_and_write(td))
+		f->last_pos[DDIR_READ] = f->last_pos[DDIR_WRITE] = f->last_pos[DDIR_TRIM]
+			= value;
+	else
+		f->last_pos[ddir] = value;
+}
+
 static int get_next_seq_offset(struct thread_data *td, struct fio_file *f,
 			       enum fio_ddir ddir, uint64_t *offset)
 {
@@ -349,28 +365,63 @@ static int get_next_seq_offset(struct thread_data *td, struct fio_file *f,
 
 	assert(ddir_rw(ddir));
 
+    // If position at the end of the last I/O is beyond the I/O range
+    // (which is starting offset + I/O range size) and we are time based
+    // then reset last pos back to beginning of I/O range
+    // TODO Ignoring ddir_seq_add < 0 handling as there are missing cases, disabled the
+    // TODO ddir_seq_add < 0 case.
+    // TODO If ddir_seq_add < 0, then we need to reset to end of range at beginning
+    // TODO if time based. Also will we terminate if not time based after first pass?
+    // TODO ddir_seq_add < 0 works last_pos in reverse but not if seq_add <= block size
+    // TODO as you will move in a positive direction in this case. Disallow case?
+    // TODO If ddir_seq_add < 0 and abs(ddir_seq_add) == block size then just loop on
+    // TODO same block and lots of overlapping I/O when iodepth > 1. Disallow case?
 	if (f->last_pos[ddir] >= f->io_size + get_start_offset(td, f) &&
 	    o->time_based) {
-		struct thread_options *o = &td->o;
+
+		// TODO This code handles case where io_size is not even multiple of minimum block size
+		// TODO and where subtracting io_size would not reset to starting offset.
+		// TODO Can't you simply to reset last_pos to get_start_offset?
 		uint64_t io_size = f->io_size + (f->io_size % o->min_bs[ddir]);
 
+		// TODO Note the case where ddir_seq_add is not an even multiple is not being handled.
+		// TODO This next IF is ignoring get_start_offset in io_size and is meaningful only
+		// TODO when get_start_offset returns 0. Even in the 0 case we can only come here if
+		// TODO last_pos == io_size so this next IF is not possibly true.
 		if (io_size > f->last_pos[ddir])
-			f->last_pos[ddir] = 0;
+			// TODO Seems like you would like to reset to get_start_offset rather than 0
+			// TODO which might work for both IF cases. 0 makes pos below into negative value.
+			reset_last_pos(td, f, ddir, 0);
 		else
-			f->last_pos[ddir] = f->last_pos[ddir] - io_size;
+			reset_last_pos(td, f, ddir, f->last_pos[ddir] - f->io_size);
 	}
 
+	// If not at end of I/O range then go find the relative offset within range
+	// else non-timed based workload we are using loops so just stop as at the end
+	// of one loop.
+	// TODO Not taking offset_increment into account by using real_file_size
+	// TODO How does file_append ever work as file_offset starts at real_file_size?
 	if (f->last_pos[ddir] < f->real_file_size) {
 		uint64_t pos;
 
+		// If at start of I/O range and using negative sequencing offset then set to end of range
+		// TODO If ddir_seq_add not even multiple of io_size, test should be
+		// TODO last_pos <= f->file_offset and after seq_add is applied
+		// TODO If absolute_value(ddir_seq_add) less than block size then the first I/O would do
+		// TODO real_file_size - seq_add which would read or write beyond real_file_size. Disallow case?
+		// TODO Also not taking offset_increment into account by using real_file_size
+		// TODO should reset to last_pos = file_offset + io_size
 		if (f->last_pos[ddir] == f->file_offset && o->ddir_seq_add < 0) {
 			if (f->real_file_size > f->io_size)
-				f->last_pos[ddir] = f->io_size;
+				reset_last_pos(td, f, ddir, f->io_size);
 			else
-				f->last_pos[ddir] = f->real_file_size;
+				reset_last_pos(td, f, ddir, f->real_file_size);
 		}
 
+		// Get relative offset within I/O range
 		pos = f->last_pos[ddir] - f->file_offset;
+		// If not at beginning of I/O range and sequencing offset exists
+		// then add positive or negative sequencing offset
 		if (pos && o->ddir_seq_add) {
 			pos += o->ddir_seq_add;
 
@@ -380,15 +431,28 @@ static int get_next_seq_offset(struct thread_data *td, struct fio_file *f,
 			 * beginning again. If we're doing backwards IO,
 			 * wrap to the end.
 			 */
+			// TODO Is it desirable for ddir_seq_add to cause do_io to loop until
+			// TODO total bytes transferred making several passes over the data range
+			// TODO depending on the value of ddir_seq_add? Problem is that you could be rewriting
+			// TODO the same block multiple times and so can't validate every write succeeded.
+			// TODO pos is a relative offset and so this IF needs to compare to io_size and not real_file_size
 			if (pos >= f->real_file_size) {
-				if (o->ddir_seq_add > 0)
+				if (o->ddir_seq_add > 0) {
 					pos = f->file_offset;
-				else {
-					if (f->real_file_size > f->io_size)
-						pos = f->io_size;
-					else
-						pos = f->real_file_size;
+					reset_last_pos(td, f, ddir, f->file_offset);
 
+				// TODO Can this ELSE be executed? First time through when ddir_seq_add < 0 we reset
+				// TODO above to io_size or real_file_size and then apply negative ddir_seq_add so in
+				// TODO this case and thereafter we are always pos < real_file_size so the
+				// TODO if pos >= f->real_file_size always fails and never enter this block.
+				} else {
+					if (f->real_file_size > f->io_size) {
+						pos = f->io_size;
+						reset_last_pos(td, f, ddir, f->io_size);
+					} else {
+						pos = f->real_file_size;
+						reset_last_pos(td, f, ddir, f->real_file_size);
+					}
 					pos += o->ddir_seq_add;
 				}
 			}
@@ -581,8 +645,8 @@ static unsigned int __get_next_buflen(struct thread_data *td, struct io_u *io_u,
 		power_2 = is_power_of_2(minbs);
 		if (!td->o.bs_unaligned && power_2)
 			buflen &= ~(minbs - 1);
-		else if (!td->o.bs_unaligned && !power_2) 
-			buflen -= buflen % minbs; 
+		else if (!td->o.bs_unaligned && !power_2)
+			buflen -= buflen % minbs;
 	} while (!io_u_fits(td, io_u, buflen));
 
 	return buflen;
@@ -601,7 +665,7 @@ static unsigned int get_next_buflen(struct thread_data *td, struct io_u *io_u,
 	return __get_next_buflen(td, io_u, is_random);
 }
 
-static void set_rwmix_bytes(struct thread_data *td)
+static void set_rwmix_bytes(struct thread_data *td, enum fio_ddir new_ddir)
 {
 	unsigned int diff;
 
@@ -610,7 +674,7 @@ static void set_rwmix_bytes(struct thread_data *td)
 	 * buffered writes may issue a lot quicker than they complete,
 	 * whereas reads do not.
 	 */
-	diff = td->o.rwmix[td->rwmix_ddir ^ 1];
+	diff = td->o.rwmix[new_ddir];
 	td->rwmix_issues = (td->io_issues[td->rwmix_ddir] * diff) / 100;
 }
 
@@ -623,7 +687,11 @@ static inline enum fio_ddir get_rand_ddir(struct thread_data *td)
 	if (v <= td->o.rwmix[DDIR_READ])
 		return DDIR_READ;
 
-	return DDIR_WRITE;
+	if (v <= (td->o.rwmix[DDIR_READ] + td->o.rwmix[DDIR_WRITE])) {
+		return DDIR_WRITE;
+	} else {
+		return DDIR_TRIM;
+	}
 }
 
 int io_u_quiesce(struct thread_data *td)
@@ -661,9 +729,9 @@ int io_u_quiesce(struct thread_data *td)
 
 static enum fio_ddir rate_ddir(struct thread_data *td, enum fio_ddir ddir)
 {
-	enum fio_ddir odir = ddir ^ 1;
-	long usec;
-	uint64_t now;
+	enum fio_ddir min_odir;
+	long usec, now, min_time;
+	int other_ddirs;
 
 	assert(ddir_rw(ddir));
 	now = utime_since_now(&td->start);
@@ -678,25 +746,42 @@ static enum fio_ddir rate_ddir(struct thread_data *td, enum fio_ddir ddir)
 	 * We are ahead of rate in this direction. See if we
 	 * should switch.
 	 */
-	if (td_rw(td) && td->o.rwmix[odir]) {
+	other_ddirs = td_eligible_ddirs(td) & ~(1 << td->rwmix_ddir);
+	if (other_ddirs != 0) {
 		/*
-		 * Other direction is behind rate, switch
+		 * If any other direction is behind rate, switch to one
+		 * that is farthest behind
 		 */
-		if (td->rate_next_io_time[odir] <= now)
-			return odir;
+		min_time = INT_MAX;
+		if ((other_ddirs & DDIR_READ_MASK) && (td->rate_next_io_time[DDIR_READ] <= min_time))  {
+			min_odir = DDIR_READ;
+			min_time = td->rate_next_io_time[DDIR_READ];
+		}
+		if ((other_ddirs & DDIR_WRITE_MASK) && (td->rate_next_io_time[DDIR_WRITE] <= min_time))  {
+			min_odir = DDIR_WRITE;
+			min_time = td->rate_next_io_time[DDIR_WRITE];
+		}
+		if ((other_ddirs & DDIR_TRIM_MASK) && (td->rate_next_io_time[DDIR_TRIM] <= min_time))  {
+			min_odir = DDIR_TRIM;
+			min_time = td->rate_next_io_time[DDIR_TRIM];
+		}
+
+		assert(min_time != INT_MAX);
+		if (min_time <= now)
+			return min_odir;
 
 		/*
-		 * Both directions are ahead of rate. sleep the min
-		 * switch if necissary
+		 * All directions are ahead of rate. sleep the min
+		 * but switch only if next i/o time is less
 		 */
-		if (td->rate_next_io_time[ddir] <=
-			td->rate_next_io_time[odir]) {
+		if (td->rate_next_io_time[ddir] <= min_time) {
 			usec = td->rate_next_io_time[ddir] - now;
 		} else {
-			usec = td->rate_next_io_time[odir] - now;
-			ddir = odir;
+			usec = min_time - now;
+			ddir = min_odir;
 		}
-	} else
+
+	} else  // No other direction, only 1 I/O type
 		usec = td->rate_next_io_time[ddir] - now;
 
 	if (td->o.io_submit_mode == IO_MODE_INLINE)
@@ -712,7 +797,7 @@ static enum fio_ddir rate_ddir(struct thread_data *td, enum fio_ddir ddir)
  * mixed read/write workload, check the rwmix cycle and switch if
  * necessary.
  */
-static enum fio_ddir get_rw_ddir(struct thread_data *td)
+static enum fio_ddir get_rw_ddir(struct thread_data *td, struct io_u *io_u)
 {
 	enum fio_ddir ddir;
 
@@ -734,7 +819,19 @@ static enum fio_ddir get_rw_ddir(struct thread_data *td)
 			return DDIR_SYNC_FILE_RANGE;
 	}
 
-	if (td_rw(td)) {
+	// trimwrite is different as it does a trim and then a write
+	// on the same offset, flipping between trim and write
+	if (td_trim_and_write(td)) {
+		struct fio_file *f = io_u->file;
+		if (f->last_pos[DDIR_WRITE] == f->last_pos[DDIR_TRIM])
+			ddir = DDIR_TRIM;
+		else
+			ddir = DDIR_WRITE;
+		return ddir;
+	}
+
+	// Handle multi-direction workloads else single direction workloads never vary
+	if (td_multiple_ddirs(td)) {
 		/*
 		 * Check if it's time to seed a new data direction.
 		 */
@@ -747,7 +844,7 @@ static enum fio_ddir get_rw_ddir(struct thread_data *td)
 			ddir = get_rand_ddir(td);
 
 			if (ddir != td->rwmix_ddir)
-				set_rwmix_bytes(td);
+				set_rwmix_bytes(td, ddir);
 
 			td->rwmix_ddir = ddir;
 		}
@@ -767,15 +864,7 @@ static enum fio_ddir get_rw_ddir(struct thread_data *td)
 
 static void set_rw_ddir(struct thread_data *td, struct io_u *io_u)
 {
-	enum fio_ddir ddir = get_rw_ddir(td);
-
-	if (td_trimwrite(td)) {
-		struct fio_file *f = io_u->file;
-		if (f->last_pos[DDIR_WRITE] == f->last_pos[DDIR_TRIM])
-			ddir = DDIR_TRIM;
-		else
-			ddir = DDIR_WRITE;
-	}
+	enum fio_ddir ddir = get_rw_ddir(td, io_u);
 
 	io_u->ddir = io_u->acct_ddir = ddir;
 
@@ -879,7 +968,7 @@ static int fill_io_u(struct thread_data *td, struct io_u *io_u)
 		 */
 		if (f->file_offset >= f->real_file_size)
 			f->file_offset = f->real_file_size - f->file_offset;
-		f->last_pos[io_u->ddir] = f->file_offset;
+		reset_last_pos(td, f, io_u->ddir, f->file_offset);
 		td->io_skip_bytes += td->o.zone_skip;
 	}
 
@@ -1471,7 +1560,8 @@ again:
 		assert(io_u->flags & IO_U_F_FREE);
 		io_u_clear(td, io_u, IO_U_F_FREE | IO_U_F_NO_FILE_PUT |
 				 IO_U_F_TRIMMED | IO_U_F_BARRIER |
-				 IO_U_F_VER_LIST);
+				 IO_U_F_VER_LIST| IO_U_F_TRIM_VER |
+				 IO_U_F_WRITE_VER);
 
 		io_u->error = 0;
 		io_u->acct_ddir = -1;
@@ -1640,7 +1730,7 @@ struct io_u *get_io_u(struct thread_data *td)
 		}
 
 		f->last_start[io_u->ddir] = io_u->offset;
-		f->last_pos[io_u->ddir] = io_u->offset + io_u->buflen;
+		reset_last_pos(td, f, io_u->ddir, io_u->offset + io_u->buflen);
 
 		if (io_u->ddir == DDIR_WRITE) {
 			if (td->flags & TD_F_REFILL_BUFFERS) {
@@ -1650,7 +1740,7 @@ struct io_u *get_io_u(struct thread_data *td)
 			} else if ((td->flags & TD_F_SCRAMBLE_BUFFERS) &&
 				   !(td->flags & TD_F_COMPRESS))
 				do_scramble = 1;
-			if (td->flags & TD_F_VER_NONE) {
+			if (!(td->flags & TD_F_VER_NONE)) {
 				populate_verify_io_u(td, io_u);
 				do_scramble = 0;
 			}
@@ -1660,6 +1750,11 @@ struct io_u *get_io_u(struct thread_data *td)
 			 * buffer is used for writes it is refilled.
 			 */
 			io_u->buf_filled_len = 0;
+
+		} else if (io_u->ddir == DDIR_TRIM) {
+			// Update tracking array to indicate space no longer exists
+			if (!(td->flags & TD_F_VER_NONE))
+				populate_verify_io_u_trim(td, io_u);
 		}
 	}
 

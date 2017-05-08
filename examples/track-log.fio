@@ -1,0 +1,44 @@
+# track-log.fio - turn on checksum tracking so checksums are tracked persistently
+# across fio jobs and fio runs in a tracking log. Once a block is read or written,
+# the checksum is stored in the tracking array and future read I/Os of this block
+# must agree with in memory tracking array. Checksums are written from the tracking
+# array to the tracking log at the end of a fio job and read in at the beginning of
+# any subsequent fio job. The very first job should not require a log to be present
+# but subsequent fio jobs or fio runs can require a tracking log to be present.
+# Also includes example for using trims in mixed workload.
+
+[global]
+ioengine=libaio
+fallocate=0
+filename=/dev/sdb
+direct=1
+buffered=0
+iodepth=1
+bs=1m
+ba=1m
+verify_interval=1m
+size=100M
+fadvise_hint=0
+verify=crc32c
+verify_fatal=1
+verify_dump=1
+verify_track=1
+verify_track_log=1
+
+[Init]
+rw=randwrite
+
+# After the initial run, the tracking log will exist if the run was successful
+# so you can uncomment this line for subsequent runs or move it to the global section.
+# Of course after the initial run, you never have to do this Init job again anyway.
+# verify_track_required=1
+
+
+[Run]
+# Trim of Linux block devices are dependent on I/O size. VMWARE only allows trims if I/O size
+# is at least 1M and VM hardware level is at least 11 (see vSphere VM setting). Note
+# you need privilege to write a Linux block device.
+rw=writetrim
+rwtmix=0,50,50
+verify_track_required=1
+stonewall

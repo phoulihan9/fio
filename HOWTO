@@ -93,6 +93,8 @@ Command line options
 			Dump info related to I/O rate switching.
     *compress*
 			Dump info related to log compress/decompress.
+	*chksum*
+			Dump time & tracking checksum info for every I/O
     *?* or *help*
 			Show available debug options.
 
@@ -950,21 +952,46 @@ I/O type
 				Sequential reads.
 		**write**
 				Sequential writes.
-		**trim**
-				Sequential trims (Linux block devices only).
 		**randwrite**
 				Random writes.
 		**randread**
 				Random reads.
-		**randtrim**
-				Random trims (Linux block devices only).
 		**rw,readwrite**
-				Sequential mixed reads and writes.
+				Sequential mixed reads or writes.
 		**randrw**
-				Random mixed reads and writes.
+				Random mixed reads or writes.
+
+		Trim I/O has several requirements:
+		 - File system and OS support varies but Linux block devices
+		   accept trims. You need privilege to write to a Linux block device.
+		   See example fio: track-mem.fio
+		 - Often minimal block size required. Linux on VMware requires
+		   at least 1 MB in size aligned on 1 MB boundary
+		 - VMware requires minimum VM OS hardware level 11
+		 - To verify the trim I/Os requires verify_track
+
+		Trim I/O patterns are:
+
+		**trim**
+				Sequential trims
+		**readtrim**
+				Sequential mixed reads or trims
 		**trimwrite**
-				Sequential trim+write sequences. Blocks will be trimmed first,
-				then the same blocks will be written to.
+				Sequential mixed trim then write. Each block
+				will be trimmed first, then written to.
+		**writetrim**
+				Sequential mixed writes or trims.
+				Each block will be trimmed or written.
+		**rwt,readwritetrim**
+				Sequential mixed reads/writes/trims
+		**randtrim**
+				Random trims
+		**randreadtrim**
+				Random mixed reads or trims
+		**randwritetrim**
+				Random mixed writes or trims
+		**randrwt**
+				Random mixed reads/writes/trims
 
 	Fio defaults to read if the option is not specified.  For the mixed I/O
 	types, the default is to split them 50/50.  For certain types of I/O the
@@ -976,7 +1003,8 @@ I/O type
 	pattern, then the value specified will be added to the generated offset for
 	each I/O.  For instance, using ``rw=write:4k`` will skip 4k for every
 	write. It turns sequential I/O into sequential I/O with holes.  See the
-	:option:`rw_sequencer` option.
+	:option:`rw_sequencer` option. Storage array vendors often require
+	trims to use a minimum block size.
 
 .. option:: rw_sequencer=str
 
@@ -1153,16 +1181,28 @@ I/O type
 
 .. option:: rwmixread=int
 
-	Percentage of a mixed workload that should be reads. Default: 50.
+	How large a percentage of the mix should be reads when both reads and writes
+	are specified in the rw option. Defaults to 50. If rwmixwrite is not present,
+	rwmixwrite defaults to 100-rwmixread and trims default to 0.
 
 .. option:: rwmixwrite=int
 
-	Percentage of a mixed workload that should be writes. If both
-	:option:`rwmixread` and :option:`rwmixwrite` is given and the values do not
-	add up to 100%, the latter of the two will be used to override the
-	first. This may interfere with a given rate setting, if fio is asked to
-	limit reads or writes to a certain rate.  If that is the case, then the
-	distribution may be skewed. Default: 50.
+	How large a percentage of the mix should be writes when both reads and writes
+	are specified in the rw option. If both rwmixread and rwmixwrite is given and
+	the values do not add up to 100%, the latter of the two will be used
+	to override the first. This may interfere with a given rate setting, if fio is
+	asked to limit reads/writes to a certain rate. If that is the case, then the
+	distribution may be skewed. Defaults to 50. If rwmixread is not present,
+	rwmixread defaults to 100-rwmixwrite and trims default to 0.
+
+.. option:: rwtmix=int[,int][,int]
+
+	When trims along with reads and/or writes are specified in the rw option then
+	this is the preferred argument for specifying mix percentages. The argument is
+	of the form: read,write,trim and the percentages must total 100.  Note any
+	argument may be empty to leave that value at its default from rwmix* arguments
+	of 50,50,0. If a trailing comma isn't given, the remainder will inherit
+	the last value set.
 
 .. option:: random_distribution=str:float[,str:float][,str:float]
 
@@ -1273,7 +1313,8 @@ Block size
 	The block size in bytes used for I/O units. Default: 4096.  A single value
 	applies to reads, writes, and trims.  Comma-separated values may be
 	specified for reads, writes, and trims.  A value not terminated in a comma
-	applies to subsequent types.
+	applies to subsequent types. Noe storage array vendors often require trims
+	to use a minimum block size.
 
 	Examples:
 
@@ -1526,7 +1567,8 @@ I/O size
 	possible to give size as a percentage between 1 and 100. If ``size=20%`` is
 	given, fio will use 20% of the full size of the given files or devices.
 	Can be combined with :option:`offset` to constrain the start and end range
-	that I/O will be done within.
+	that I/O will be done within. Note any bytes read for verification
+	are not counted against size.
 
 .. option:: io_size=int, io_limit=int
 
@@ -1910,7 +1952,8 @@ I/O depth
 	achieved.  This may happen on Linux when using libaio and not setting
 	:option:`direct` =1, since buffered I/O is not async on that OS.  Keep an
 	eye on the I/O depth distribution in the fio output to verify that the
-	achieved depth is as expected. Default: 1.
+	achieved depth is as expected. iodepth greater than 1 can only be verified
+	if randommap is enabled. Default: 1.
 
 .. option:: iodepth_batch_submit=int, iodepth_batch=int
 
@@ -1971,7 +2014,7 @@ I/O depth
 	has a bit of extra overhead, especially for lower queue depth I/O where it
 	can increase latencies. The benefit is that fio can manage submission rates
 	independently of the device completion rates. This avoids skewed latency
-	reporting if I/O gets back up on the device side (the coordinated omission
+	reporting if I/O gets backed up on the device side (the coordinated omission
 	problem).
 
 
@@ -2315,8 +2358,8 @@ Verification
 
 .. option:: do_verify=bool
 
-	Run the verify phase after a write phase. Only valid if :option:`verify` is
-	set. Default: true.
+	Run the verify phase after a write/trim phase. Only valid if
+	:option:`verify` is set. Default: true.
 
 .. option:: verify=str
 
@@ -2398,10 +2441,45 @@ Verification
 			:option:`ioengine` `=null`, not for much else.
 
 	This option can be used for repeated burn-in tests of a system to make sure
-	that the written data is also correctly read back. If the data direction
-	given is a read or random read, fio will assume that it should verify a
-	previously written file. If the data direction includes any form of write,
-	the verify will be of the newly written data.
+	that the written data is also correctly read back. If rw=read or randread
+	then all reads are verified as fio assumes a previously written file. If rw=
+	includes any form of write, the verify will be only for the newly written data.
+
+	Verification uses separate header and data checksums to detect corruption.
+	Corruption errors report:
+
+	<checksumMethod>: <error_message> at file <filename> offset <file_offset>
+					  length <length_of_corrupt_area>
+
+	where <error_message> is:
+
+		"verify failed" - checksum of the data failed
+		"version verify failed" - tracking checksum failed, see verify_track.
+		"bad magic header" - Magic number 0x'acca' missing in header.
+		"bad header length" - header length incorrect
+		"bad header rand_seed" - unexpected random seed
+		"bad header offset" - unexpected file offset for this verify_interval
+			within the file.
+		"bad header numberio" - unexpected numberio value in header
+		"bad header crc" - the header checksum has failed.
+		"all zeroes verify failed" - read after trim failed to return a block
+			of all zeroes
+
+	Expected CRC - data checkssum embedded in the header
+	Received CRC - checksum generated from the read data
+
+	Possible corruption diagnostic files created:
+
+		*.<fileoffset>.expected - Only present if all header checks pass and
+		data checksum fails. The exact expected data can be regenerated from the
+		random seed stored in the header.
+		*.<fileoffset>.received - The block whose checksum has just failed. Note
+		Fio places a new header/data checksums into every verify_interval within
+		the file. Using hexdump and diff you can determine which portions of the
+		read data are corrupt.
+		*.<fileoffset>.complete - If verify_interval is less than blocksize then
+		the complete I/O buffer is output to this file. Read the file offset on disk
+		using dd and hexdump & diff to compare what was read to contents on disk.
 
 .. option:: verifysort=bool
 
@@ -2511,7 +2589,7 @@ Verification
 
 .. option:: trim_percentage=int
 
-	Number of verify blocks to discard/trim.
+	Percentage of written verify blocks to discard/trim.
 
 .. option:: trim_verify_zero=bool
 
@@ -2527,7 +2605,92 @@ Verification
 
 .. option:: experimental_verify=bool
 
-	Enable experimental verification.
+	Enable experimental verification. Incompatible with verify_track.
+
+.. option:: verify_track=bool
+
+	Fio normally verifies data within a verify_interval	with checksums and file
+	offsets embedded in the data. However a prior version of a block could be
+	returned and verified successfully. When verify_track is enabled the checksum
+	for every verify_interval in the file is stored in a table and all read data
+	must match the checksums in the table. The tracking table is sized as
+	(size / verify_interval) * 4 bytes. For very large size= option settings,
+	such a large memory allocation may impact testing. Reads assume that the entire
+	file has been previously written with a verification format using the same
+	verify_interval. When verify_track is enabled, all reads are verified, whether
+	writes are present in the workload or not. Sharing files by threads within a job
+	is supported but not between jobs running concurrently so use the stonewall
+	option when more than one non-global job is present. Verify of trimmed blocks
+	is described for the verify_track_trim_zero option. When disabled, fio falls
+	back on verification described under the verify option. The restrictions when
+	enabling the verify_track option are:
+		- randommap is required
+		- softrandommap is not supported
+		- lfsr random generator not supported when using multiple block sizes
+		- stonewall option required when more than one job present
+		- file size must be an even multiple of the block size when iodepth > 1
+		- verify_backlog not supported when iodepth > 1
+		- verify_async is not supported
+		- file sharing between concurrent jobs not supported
+		- numjobs must be 1
+		- io_submit_mode must be set to "inline"
+		- verify=null or pattern are not supported
+		- verify_only is not supported
+		- io_submit_mode must be set to 'inline'
+		- supplying a sequence number with rw option is not supported
+		- experimental_verify is not supported
+	Defaults to off.
+
+	You can enable verify_track for individual jobs and each job will start with
+	a empty table which is filled in as each block is initially read or written and
+	enforced on subsequent reads within the job. For persistent tracking of checksums
+	between jobs or fio runs, see verify_track_log.
+
+.. option:: verify_track_log=bool
+
+	If set when verify_track is set then on a clean shutdown, fio writes the checksum
+	for each data block that has been read or written to a log named
+	<datafilename>.tracking.log. If set when fio reopens this data file and a tracking
+	log exists then the checksums are read into the tracking table and used to validate
+	every subsequent read. This allows rigorous validation of data integrity as data
+	files are passed between fio jobs or over the termination of fio and restart on
+	the same system or on another system or after an OS reboot. Reverting a virtual
+	machine to a snapshot can be tested by saving the tracking log after a successful
+	fio run and later restoring the saved log after reverting the virtual machine.
+	The log is deleted after being read in, so on abnormal termination no stale
+	checksums can be used. This option, the data file size and verify_interval
+	parameters should not change between jobs in the same run or on restart of fio.
+	Defaults to off. verify_track_dir defines the tracking log's directory.
+
+.. option:: verify_track_required=bool
+
+	If set when verify_track_log is set then the tracking log for each file must exist
+	at the start of a fio job or an error is returned. Defaults to off which is
+	the case for the first job in a new fio run. Subsequent jobs in this run can
+	require use of the tracking log. If set to off then any tracking log found will be
+	used otherwise an empty tracking table is used. If a prior fio run created a
+	tracking log for the data file then all jobs can require use of the tracking log.
+
+.. option:: verify_track_dir=str
+
+	If verify_track_log is set then this defines the single directory for all tracking
+	logs. The default is to use the same directory where each data file resides.
+	When filename points to a block device or pipe then the directory defaults to the
+	current process default directory. To assure data integrity of the tracking log,
+	each tracking log also contains its own checksum. However when checking a device
+	for data integrity it is advisable to place tracking logs containing checksums on
+	a different, more trusted device.
+
+.. option:: verify_track_trim_zero=bool
+
+	Typically a read of a trimmed block that has not been re-written will return a block
+	of zeros. If set with verify_tracking enabled then all zeroed blocks with no tracking
+	information are assumed to have resulted from a trim. If clear zeroed blocks are
+	treated as corruption. If your device does not return zeroed blocks for reads after
+	a trim then it cannot participate in tracking verification. Fio sets to 1 if trims
+	are present in the rw argument and defaults 0 otherwise. You would only use this when
+	verify_tracking is enabled, trims are not specified in the rw argument and a prior
+	fio job or run had performed trims.
 
 
 Steady state
@@ -2963,9 +3126,13 @@ thread. The possible values (in typical life cycle order) are:
 +------+-----+-----------------------------------------------------------+
 |      |  w  | Running, doing random writes.                             |
 +------+-----+-----------------------------------------------------------+
-|      |  M  | Running, doing mixed sequential reads/writes.             |
+|      |  T  | Running, doing sequential trims.                          |
 +------+-----+-----------------------------------------------------------+
-|      |  m  | Running, doing mixed random reads/writes.                 |
+|      |  t  | Running, doing random trims.                              |
++------+-----+-----------------------------------------------------------+
+|      |  M  | Running, doing mixed sequential reads/writes/trims.       |
++------+-----+-----------------------------------------------------------+
+|      |  m  | Running, doing mixed random reads/writes/trims.           |
 +------+-----+-----------------------------------------------------------+
 |      |  F  | Running, currently waiting for :manpage:`fsync(2)`        |
 +------+-----+-----------------------------------------------------------+
@@ -3516,3 +3683,158 @@ containing two hostnames ``h1`` and ``h2`` with IP addresses 192.168.10.120 and
 
 	/mnt/nfs/fio/192.168.10.120.fileio.tmp
 	/mnt/nfs/fio/192.168.10.121.fileio.tmp
+
+
+Verification Tracking
+---------------------
+
+Absolute data integrity guarantee is the primary mission of a storage
+software/hardware subsystem. Fio is good at detecting data corruption but
+there are gaps. Currently only when rw option is set to read only are
+workload reads verified. It is desirable to validate all reads in addition
+to writes to protect against data rolling back to earlier versions.
+
+With the addition of the block's offset to the header in recent fio releases,
+block data returned for another block will be flagged as corrupt. However
+a limitation of the fio header and data embedded checksums is that fio cannot
+detect if a prior intact version of a block was returned on a read. If the
+header and data checksum match the block is declared valid.
+
+These limitations can be addressed by setting the verify_track option which
+allocates a memory array to track the header and data checksums to assure
+data integrity is absolute. The array starts out empty at the beginning of
+each fio job and is filled in as reads or writes occur, once defined the
+checksums from succeeding I/Os must all match. This option extends checksum
+verification to all reads in all workloads, not just the read-only workloads.
+
+However use of verify_track requires that fio avoid overlapping, concurrent
+reads and writes to the same block. Reading and writing a block at the same
+time yields indeterminate results and making guaranteeing data integrity
+impossible. So some fio options where this is a risk are disabled when using
+verify_track. See verify_track argument for list of restrictions.
+
+Even better verification would validate data more persistently. You would
+like to track checksums persistently between fio jobs or between runs of fio
+which could be after a shutdown/restart of the system or on a different system
+that shares storage. Proving seamless data integrity from the application
+perspective over complex failover and recovery situations like reverting a
+virtual machine to a prior snapshot is quite valuable.
+
+Also the popularity of thin LUNs in the storage world has caused problems
+if the unused disk space is not reclaimed by use of trims. So we would like
+to have the ability to mix and match trims with reads and writes. The rw option
+now supports a full set of combinations and the rwtmix=read%,write%,trim% option
+allows specifying the mix percentages of all three types of I/O in one argument.
+However trims do have special requirements as documented under the rw option.
+Finally we would like to verify trims operations. If you read a trimmed block
+before re-writing the block, it should return a block of zeroes.
+
+The verify_track_log option permits persistent checksum tracking and
+verification of trims by enabling the saving of the tracking array to a tracking
+log on the close of a data file at the end of a fio job and reading it back in
+at the next start. A clean shutdown of fio is needed for tracking log to be
+persistent. When no errors occur checksum context is automatically preserved
+between fio jobs and fio runs. On revert of a virtual machine snapshot if
+the tracking log is restored from the time of the snapshot then checksum
+context is again preserved. There is a tracking log for each data file.
+
+Tracking log filename format is: <dir>/<filename>.tracking.log
+where:
+   filename - is name of file system file or block device name like “sdb”
+   dir - is log directory that defaults to directory of data file.
+         For block devices, dir defaults to the process current default
+         directory.
+
+The tracking log is plain text and contains data from when it was first created:
+the data file name it is tracking, the size of the data file, the starting
+file offset for I/Os, its verify_interval option setting. From the last
+save of the log it has: timestamp of last save and a checksum of the
+tracking log contents. For checksums, Bit 0 = 1 defines a valid checksum.
+Bit 0 = 0 signifies special case entries (dddddddc indicates a trimmed block
+and 0 indicates an undefined entry).
+
+Tracking Log Example with "--" comments added:
+
+$ cat xxx.tracking.log
+Fio-tracking-log-version: 1
+DataFileName: xxx
+DataFileSize: 2048
+DataFileOffset: 0
+DataFileVerifyInterval: 512
+TrackingLogSaveTimestamp: 2017-02-23T14:25:32.446981
+TrackingLogChecksum: cae34cd8
+VerifyIntervalChecksums:
+4028ab33    -- Checksums from read or write of 3 blocks, Bit 0 = 1
+a450bffb
+81858a3
+dddddddc    -- Means trimmed block, Bit 0 = 0
+0           -- Means undefined entry never been accessed, Bit 0 = 0
+$
+
+Tracking arguments are:
+
+verify_track=bool - enables checksum tracking in memory
+verify_track_log=bool - enable savings and restoring of tracking log
+verify_track_required=bool - By default fio will create a log on the fly.
+    If a log is found at the start it is read and then the log file is deleted.
+    If any error occurs during the fio run then the tracking log is not
+    written on close so compromised logs do not cause false failures. However
+    testing requiring absolute data integrity guarantees will want to use this
+    option to require that the tracking log always be present between fio jobs
+    or at the start of a new fio run.
+verify_track_dir=str - Specifies dir to place all tracking logs. It is advisable
+    when evaluating the data integrity of device to place the tracking log on a
+    different, more trusted device.
+verify_track_trim_zero=bool - When no tracking array entry exists, this option
+    allows a zeroed block from prior fio run to be treated as previously trimmed
+    instead of as data corruption. Once the array entry for a block is defined,
+    this option is no longer used as the array entry determines the required
+    verification.
+debug=chksum - a new debug option allows tracing of all checksum entry
+    additions/changes to the tracking array or entry use in verification
+
+There are a couple considerations to be aware of when using tracking log.
+Tracking log is sticky. If you change the following options that make
+the tracking log no longer match the data layout then you will receive
+a persistent error until the tracking log is recreated: size= or offset=
+or verify_interval= options. You do get a friendly error indicating
+what tracking log file to delete to start with a fresh tracking log. Note
+if a fio run an fails with other errors, the tracking log is discarded so that
+stale checksums do not cause false failures on subsequent runs.
+
+The tracking log uses 4 bytes for tracking each verify_interval block
+in the data file or block device as specified by 4*(size/verify_interval).
+So there are scaling implications for memory usage and log file size.
+However blocks are only tracked for the active I/O range from:
+offset-<offset+size-1>.
+
+The performance impact of the few extra I/Os to read and write the tracking log
+between fio jobs and fio runs is negligible since one is not usually verifying
+data when doing performance studies. There is no overhead when verify tracking
+is disabled and no extra I/Os when verify_track_log is disabled.
+
+
+Data Corruption Troubleshooting
+-------------------------------
+
+When a corruption occurs immediate analysis can reveal many clues as to the
+source of the corruption. Is the corruption persistent? In memory and on disk?
+The exact pattern of the corruption is often revealing: At the beginning of
+an I/O block? Sector aligned? All zeroes or garbage? What is the exact range
+of the corruption? Is corruption a stale but intact prior version of the
+block?
+
+When a corruption is detected, three possible corrupt data files are created:
+
+*.received - the corrupt data which is possibly a verify_interval block within
+              the full block used in the I/O.
+*. complete - the full block used in the I/O
+*. expected - if the block's header is intact, the expected data pattern for
+              the *.received block can be generated
+
+Two scripts exist in the analyze directory to assist in analysis:
+
+corruption_triage.sh - a bash script that contains a sequence of diagnostic
+              steps
+fio_header.py - a python script that displays the contents of the block header
+              in a corrupt data file.

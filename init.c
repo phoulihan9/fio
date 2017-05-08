@@ -721,6 +721,41 @@ static int fixup_options(struct thread_data *td)
 		ret = 1;
 	}
 
+	if (td_multiple_ddirs(td) && !td_trim_and_write(td)) {
+		if ((o->rwmix[DDIR_READ] + o->rwmix[DDIR_WRITE] + o->rwmix[DDIR_TRIM]) != 100) {
+			log_err("fio: rwmix args must total 100%%, see rwmix* arguments\n");
+			log_err("fio: rwtmix found: Read:%d%%, Write:%d%%, Trim:%d%%\n",
+				o->rwmix[DDIR_READ], o->rwmix[DDIR_WRITE], o->rwmix[DDIR_TRIM]);
+			ret = 1;
+		}
+		if (!(td_read(td)) && (o->rwmix[DDIR_READ] != 0)) {
+			log_err("fio: rwmix reads set to %d%%, but rw argument has specified no reads\n",
+				o->rwmix[DDIR_READ]);
+			log_err("fio: rwtmix found: Read:%d%%, Write:%d%%, Trim:%d%%\n",
+				o->rwmix[DDIR_READ], o->rwmix[DDIR_WRITE], o->rwmix[DDIR_TRIM]);
+			ret = 1;
+		}
+		if (!(td_write(td)) && (o->rwmix[DDIR_WRITE] != 0)) {
+			log_err("fio: rwmix writes set to %d%%, but rw argument has specified no writes\n",
+				o->rwmix[DDIR_WRITE]);
+			log_err("fio: rwtmix found: Read:%d%%, Write:%d%%, Trim:%d%%\n",
+				o->rwmix[DDIR_READ], o->rwmix[DDIR_WRITE], o->rwmix[DDIR_TRIM]);
+			ret = 1;
+		}
+		if (!(td_trim(td)) && (o->rwmix[DDIR_TRIM] != 0)) {
+			log_err("fio: rwmix trims set to %d%%, but rw argument has specified no trims\n",
+				o->rwmix[DDIR_TRIM]);
+			log_err("fio: rwtmix found: Read:%d%%, Write:%d%%, Trim:%d%%\n",
+				o->rwmix[DDIR_READ], o->rwmix[DDIR_WRITE], o->rwmix[DDIR_TRIM]);
+			ret = 1;
+		}
+	}
+
+	// If rw=writetrim assure that ddir starts out writing instead of the usual reading
+	if ((td_writetrim(td) || td_randwritetrim(td)) && td->rwmix_ddir == DDIR_READ) {
+		td->rwmix_ddir = DDIR_WRITE;
+	}
+
 	if (!o->timeout && o->time_based) {
 		log_err("fio: time_based requires a runtime/timeout setting\n");
 		o->time_based = 0;
@@ -731,8 +766,8 @@ static int fixup_options(struct thread_data *td)
 		o->size = -1ULL;
 
 	if (o->verify != VERIFY_NONE) {
-		if (td_write(td) && o->do_verify && o->numjobs > 1) {
-			log_info("Multiple writers may overwrite blocks that "
+		if (verifiable_ddir(td) && o->numjobs > 1) {
+			log_info("Multiple writers or trimmers may overwrite blocks that "
 				"belong to other jobs. This can cause "
 				"verification failures.\n");
 			ret = warnings_fatal;
@@ -753,6 +788,8 @@ static int fixup_options(struct thread_data *td)
 			o->verify_interval = o->min_bs[DDIR_WRITE];
 		else if (td_read(td) && o->verify_interval > o->min_bs[DDIR_READ])
 			o->verify_interval = o->min_bs[DDIR_READ];
+		else if (td_trim(td) && o->verify_interval > o->min_bs[DDIR_TRIM])
+			o->verify_interval = o->min_bs[DDIR_TRIM];
 
 		/*
 		 * Verify interval must be a factor or both min and max
@@ -1065,7 +1102,7 @@ static void init_flags(struct thread_data *td)
 	if (o->scramble_buffers && !(o->zero_buffers &&
 	    fio_option_is_set(o, zero_buffers)))
 		td->flags |= TD_F_SCRAMBLE_BUFFERS;
-	if (o->verify != VERIFY_NONE)
+	if (o->verify == VERIFY_NONE)
 		td->flags |= TD_F_VER_NONE;
 
 	if (o->verify_async || o->io_submit_mode == IO_MODE_OFFLOAD)
@@ -1461,7 +1498,7 @@ static int add_job(struct thread_data *td, const char *jobname, int job_add_num,
 			p.avg_msec = min(o->log_avg_msec, o->bw_avg_time);
 		else
 			o->bw_avg_time = p.avg_msec;
-	
+
 		p.hist_msec = o->log_hist_msec;
 		p.hist_coarseness = o->log_hist_coarseness;
 
@@ -1492,7 +1529,7 @@ static int add_job(struct thread_data *td, const char *jobname, int job_add_num,
 			p.avg_msec = min(o->log_avg_msec, o->iops_avg_time);
 		else
 			o->iops_avg_time = p.avg_msec;
-	
+
 		p.hist_msec = o->log_hist_msec;
 		p.hist_coarseness = o->log_hist_coarseness;
 
@@ -2081,6 +2118,10 @@ struct debug_level debug_levels[] = {
 	{ .name = "verify",
 	  .help = "IO verification action logging",
 	  .shift = FD_VERIFY,
+	},
+	{ .name = "chksum",
+	  .help = "Verify Checksum tracking logging",
+	  .shift = FD_CHKSUM,
 	},
 	{ .name = "random",
 	  .help = "Random generation logging",

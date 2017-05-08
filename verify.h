@@ -2,6 +2,7 @@
 #define FIO_VERIFY_H
 
 #include <stdint.h>
+#include "io_ddir.h"
 #include "verify-state.h"
 
 #define FIO_HDR_MAGIC	0xacca
@@ -93,12 +94,15 @@ struct vhdr_xxhash {
  * Verify helpers
  */
 extern void populate_verify_io_u(struct thread_data *, struct io_u *);
+extern void populate_verify_io_u_trim(struct thread_data *, struct io_u *);
 extern int __must_check get_next_verify(struct thread_data *td, struct io_u *);
 extern int __must_check verify_io_u(struct thread_data *, struct io_u **);
 extern int verify_io_u_async(struct thread_data *, struct io_u **);
 extern void fill_verify_pattern(struct thread_data *td, void *p, unsigned int len, struct io_u *io_u, unsigned long seed, int use_seed);
 extern void fill_buffer_pattern(struct thread_data *td, void *p, unsigned int len);
 extern void fio_verify_init(struct thread_data *td);
+extern int verify_save_tracking_array(struct thread_data *);
+extern int verify_allocate_tracking(struct thread_data *);
 
 /*
  * Async verify offload
@@ -110,5 +114,31 @@ extern void verify_async_exit(struct thread_data *);
  * Callbacks for pasting formats in the pattern buffer
  */
 extern int paste_blockoff(char *buf, unsigned int len, void *priv);
+
+/*
+ * Verify only if do_verify and verify are set. Also
+ * if write or trim (but not trim & write) and verify enabled and
+ * not experimental verify then log the I/O for later verification.
+ * Trim & write is unusual as two I/Os (trim and then write) are
+ * performed serially on each block by relying on a fragile
+ * handoff from the freelist so we can't safely insert a read
+ * to verify the trim. The follow-on write is verified though due
+ * to the first clause. Note trims can only be meaningfully verified
+ * if verify_track is used otherwise fio assumes reads following
+ * a trim returning a zeroed block is corruption. verify_track
+ * tracks trims not followed by a write and allows reads of
+ * such blocks to be zeroed.
+ */
+#define verify_enabled(td)    ((td)->o.do_verify && (td)->o.verify != VERIFY_NONE)
+#define verifiable_ddir(td)   (verify_enabled(td) && ((td_write(td)) || _verifiable_trims(td)))
+#define verifiable_writes(td) (verify_enabled(td) && td_write(td))
+#define verifiable_trims(td)  (verify_enabled(td) && _verifiable_trims(td))
+#define _verifiable_trims(td) (td_trim(td) && !td_trim_and_write(td) && (td)->o.verify_track)
+#define verifiable_io(td, io_u)  (verify_enabled(td) && \
+       (((io_u)->ddir == DDIR_WRITE) || \
+        ((io_u)->ddir == DDIR_TRIM && !td_trim_and_write(td) && (td)->o.verify_track)))
+#define tracking_enabled(td)  ((td->o.verify != VERIFY_NONE) && td->o.verify_track)
+#define tracking_log_enabled(td)  ((td->o.verify != VERIFY_NONE) && td->o.verify_track \
+                                    && td->o.verify_track_log)
 
 #endif

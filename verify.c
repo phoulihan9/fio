@@ -128,11 +128,17 @@ static void memswp(void *buf1, void *buf2, unsigned int len)
 
 static void hexdump(void *buffer, int len)
 {
-	unsigned char *p = buffer;
+	uint32_t *p = buffer;
 	int i;
 
-	for (i = 0; i < len; i++)
-		log_err("%02x", p[i]);
+	if (len == 1) log_err("%02x", *p & 0xff);
+	if (len == 2) log_err("%04x", *p & 0xffff);
+	if (len == 3) log_err("%06x", *p & 0xffffff);
+	if (len >= 4) {
+		assert(!(len % 4));
+		for (i = 0; i < len/4; i++)
+			log_err("%08x ", p[i]);
+	}
 	log_err("\n");
 }
 
@@ -227,6 +233,8 @@ struct vcont {
 	 */
 	struct io_u *io_u;
 	unsigned int hdr_num;
+	unsigned int hdr_inc;
+	void *hdr;
 	struct thread_data *td;
 
 	/*
@@ -291,6 +299,17 @@ static void dump_buf(char *buf, unsigned int len, unsigned long long offset,
 	free(ptr);
 }
 
+static void __dump_complete_buffer(struct thread_data *td, struct io_u *io_u)
+{
+	if (td->o.verify_interval && (td->o.verify_interval < io_u->buflen)) {
+		/*
+		 * Dump the entire buffer we just read off disk
+		 */
+		dump_buf(io_u->buf, io_u->buflen, io_u->offset,
+				 "complete", io_u->file);
+	}
+}
+
 /*
  * Dump the contents of the read block and re-generate the correct data
  * and dump that too.
@@ -321,6 +340,9 @@ static void __dump_verify_buffers(struct verify_header *hdr, struct vcont *vc)
 	dummy = *io_u;
 	dummy.buf = buf;
 	dummy.rand_seed = hdr->rand_seed;
+	dummy.start_time.tv_sec = hdr->time_sec;
+	dummy.start_time.tv_usec = hdr->time_usec;
+	dummy.numberio = hdr->numberio;
 	dummy.buf_filled_len = 0;
 	dummy.buflen = io_u->buflen;
 
@@ -329,6 +351,12 @@ static void __dump_verify_buffers(struct verify_header *hdr, struct vcont *vc)
 	dump_buf(buf + hdr_offset, hdr->len, io_u->offset + hdr_offset,
 			"expected", vc->io_u->file);
 	free(buf);
+
+	/*
+	 * Finally dump complete read buffer
+	 */
+	__dump_complete_buffer(td, io_u);
+
 }
 
 static void dump_verify_buffers(struct verify_header *hdr, struct vcont *vc)
@@ -342,6 +370,25 @@ static void dump_verify_buffers(struct verify_header *hdr, struct vcont *vc)
 	}
 
 	__dump_verify_buffers(hdr, vc);
+}
+
+static void dump_received_buffer(struct thread_data *td, struct io_u *io_u,
+				struct verify_header *hdr,unsigned int hdr_num,
+				unsigned int hdr_len)
+{
+	unsigned long hdr_offset;
+
+	if (!td->o.verify_dump)
+		return;
+
+	/*
+	 * Dump the contents of corrupt chunk just read off disk
+	 */
+	hdr_offset = hdr_num * hdr->len;
+	dump_buf(io_u->buf + hdr_offset, hdr_len, io_u->offset + hdr_offset,
+			"received", io_u->file);
+
+	__dump_complete_buffer(td, io_u);
 }
 
 static void log_verify_failure(struct verify_header *hdr, struct vcont *vc)
@@ -361,6 +408,681 @@ static void log_verify_failure(struct verify_header *hdr, struct vcont *vc)
 	}
 
 	dump_verify_buffers(hdr, vc);
+}
+
+const char tracker_version_label[]   = "Fio-tracking-log-version:";
+const char tracker_filename_label[]  = "DataFileName:";
+const char tracker_size_label[]	  	 = "DataFileSize:";
+const char tracker_offset_label[]	 = "DataFileOffset:";
+const char tracker_interval_label[]  = "DataFileVerifyInterval:";
+const char tracker_timestamp_label[] = "TrackingLogSaveTimestamp:";
+const char tracker_checksum_label[]  = "TrackingLogChecksum:";
+const char tracker_checksums_label[] = "VerifyIntervalChecksums:";
+
+unsigned int tracker_log_version = 1;
+
+// Retrieve the tracking array index for this verify_interval block
+// We only track from starting offset of I/O range so subtract file_offset.
+uint64_t get_tracking_index(struct thread_data *td, struct io_u *io_u,
+			 uint64_t offset, unsigned int hdr_inc)
+{
+	struct fio_file *f = io_u->file;
+	uint64_t index;
+
+	index = (offset - f->file_offset) / hdr_inc;
+	if (index > f->tracking_max) {
+		log_err("fio: exceeded tracking array max index: %"PRIu64", max: %d, offset: %"PRIu64", inc: %d, file: %s\n",
+			index, f->tracking_max, offset, hdr_inc, f->file_name);
+		assert(0);
+	}
+	return index;
+}
+
+// Retrieve the tracking array entry for this verify_interval block
+uint32_t get_tracking_entry(struct thread_data *td, struct io_u *io_u,
+			 unsigned int hdr_num, unsigned int hdr_inc)
+{
+	struct fio_file *f = io_u->file;
+	uint64_t index, block_offset;
+	block_offset = io_u->offset + (hdr_num * hdr_inc);
+	index = get_tracking_index(td, io_u, block_offset, hdr_inc);
+	return f->tracking_array[index];
+}
+
+/*
+ * Save sum of the two checksums in tracking array to detect block
+ * reverting to an earlier version.
+ */
+static void save_tracking(struct thread_data *td, struct io_u *io_u,
+			 struct verify_header *hdr, unsigned int header_inc)
+{
+	struct fio_file *f = io_u->file;
+	uint32_t *data_checksum = (void *)hdr + sizeof(struct verify_header);
+	uint32_t index;
+
+	index = get_tracking_index(td, io_u, hdr->offset, header_inc);
+
+	/* Combine header checksum plus the first 32 bits of the
+	   data checksum and set Bit0 to indicate array entry exists */
+	f->tracking_array[index] = (hdr->crc32 + *data_checksum) | TRACKING_EXISTS;
+	/* Track changes to the tracking array in this case for a write:
+	   "AW" for write I/O adding tracking checksum to array and first value
+	   is file offset to the verify_interval block within this buffer,
+	   u=microseconds when block written, t=tracking checksum,
+	   h=header checksum, d=data checksum */
+	dprint(FD_CHKSUM, "AW:%"PRIu64" u:%d t:%08x h:%08x d:%08x\n",
+		hdr->offset, ((hdr->time_sec * 1000000) + hdr->time_usec),
+		f->tracking_array[index], hdr->crc32, *data_checksum);
+}
+
+/*
+ * Save trimmed state in tracking array. Either don't have a buffer or
+ * buffer is all zeros so need separate save routine.
+ */
+static void save_tracking_trimmed(struct thread_data *td, struct io_u *io_u,
+			 unsigned int header_num, unsigned int header_inc)
+{
+	struct fio_file *f = io_u->file;
+	uint32_t index;
+	uint64_t offset;
+
+	offset = (uint64_t)io_u->offset + (header_num * header_inc);
+	index = get_tracking_index(td, io_u, offset, header_inc);
+	f->tracking_array[index] = TRACKING_TRIMMED;
+	/* Track changes to the tracking array in this case for a trim:
+	   "AT" for trim I/O adding a new tracking checksum to array and
+	   first value is file offset to the verify_interval block within this buffer,
+	   u=microseconds when block trimmed, t=tracking checksum */
+	dprint(FD_CHKSUM, "AT:%"PRIu64" u:%lu t:%08x\n",
+		offset, ((io_u->start_time.tv_sec * 1000000) + io_u->start_time.tv_usec),
+		f->tracking_array[index]);
+}
+
+/*
+ * Verify sum of the two checksums in tracking array to detect block
+ * reverting to an earlier version.
+ */
+int _verify_tracking(struct thread_data *td, struct io_u *io_u,
+			 struct verify_header *hdr, unsigned int hdr_num,
+			 unsigned int hdr_inc)
+{
+	struct fio_file *f = io_u->file;
+	uint32_t *data_checksum = (void *)hdr + sizeof(struct verify_header);
+	uint32_t found;
+	uint64_t index;
+	const char * op;
+	const char * VR = "VR";
+	const char * VW = "VW";
+	const char * AR = "AR";
+
+	index = get_tracking_index(td, io_u, hdr->offset, hdr_inc);
+
+	/* If version checksum exists then it must match or wrong version
+	 * of block has been returned. */
+	found = (hdr->crc32 + *data_checksum) | TRACKING_EXISTS;
+	if (entry_is_checksum(f->tracking_array[index]) ) {
+		if (f->tracking_array[index] != found) {
+			log_err("tracking: version verify failed at file %s offset %llu, length %u\n",
+				f->file_name,
+				io_u->offset + hdr_num * hdr_inc, hdr_inc);
+			log_err("       Expected Tracking CRC: %08x\n", f->tracking_array[index]);
+			log_err("       Received Tracking CRC: %08x\n", found);
+			dump_received_buffer(td, io_u, hdr, hdr_num, hdr_inc);
+			if (td->o.verify_track_log) {
+				log_err("To discard tracking checksum expectations on restart, first delete: %s\n", f->tracking_log_name);
+			}
+			return EILSEQ;
+		} else {
+			op = VR;
+			if (is_write_verify) op = VW;
+		}
+	} else {
+		f->tracking_array[index] = found;
+		op = AR;
+	}
+	/* Report checksum tracking array activity. First token defined as:
+	   "AR" for read I/O adding a new tracking checksum to array
+	   "VR" for read that verifies against pre-existing array checksum
+	   "VW" for write verify read that verifies against pre-existing array checksum.
+	   First Value is file offset to the verify_interval block within this buffer,
+	   u=microseconds when block written or verified based on first 2 bytes,
+	   t=tracking checksum, h=header checksum, d=data checksum */
+	dprint(FD_CHKSUM, "%s:%"PRIu64" u:%d t:%08x h:%08x d:%08x\n",
+		op, hdr->offset, ((hdr->time_sec * 1000000) + hdr->time_usec),
+		f->tracking_array[index], hdr->crc32,  *data_checksum);
+	return 0;
+}
+
+// Trims needs to update tracking array indicating space no longer exists
+void populate_verify_io_u_trim(struct thread_data *td, struct io_u *io_u)
+{
+	unsigned int hdr_inc, hdr_num = 0;
+	void *p;
+
+	if (td->o.verify == VERIFY_NULL)
+		return;
+	assert(io_u->ddir == DDIR_TRIM);
+
+	if (td->o.verify_track) {
+		hdr_inc = get_hdr_inc(td, io_u);
+		for (p = io_u->buf; p < io_u->buf + io_u->buflen;
+			p += hdr_inc, hdr_num++) {
+			save_tracking_trimmed(td, io_u, hdr_num, hdr_inc);
+		}
+	}
+}
+
+// Restore tracking array from tracking log
+int restore_tracking_array(struct thread_data *td, struct fio_file *f) {
+
+	const char suffix[] = ".tracking.log";
+	char default_dir[] = ".";
+	char file_name[PATH_MAX];
+	char *str_file_name = file_name;
+	FILE *file;
+	int max_rec = 256, r, reads, ret = 0;
+	char *dir, *base, *p;
+	unsigned int version, file_interval;
+	uint64_t file_size, file_offset;
+	uint32_t checksum, crc;
+	char str_buf[max_rec];
+	char *str = str_buf;
+	char label_buf[max_rec+16];
+	char *label = label_buf;
+	char timestamp[64];
+	char *str_timestamp = timestamp;
+
+	if (!td->o.verify_track_log) {
+		f->tracking_log_name = NULL;
+		return 0;
+	}
+	// Construct tracking log filename
+	if (td->o.verify_track_dir != NULL) {
+		dir = td->o.verify_track_dir;
+	} else {
+		// If block device or pipe then default to current default directory
+		// else default to directory where data file exists
+		if (f->filetype != FIO_TYPE_FILE)
+			dir = default_dir;
+		else
+			dir = dirname(f->file_name);
+	}
+	base = basename(f->file_name);
+	if (snprintf(file_name, PATH_MAX, "%s/%s%s", dir, base, suffix) >= PATH_MAX) {
+		log_err("fio: tracking log file name exceeds max of %d chars, log name: %s/%s%s truncated to %s\n",
+			PATH_MAX, dir, base, suffix, file_name);
+		ret = 1;
+		goto err2;
+	}
+	f->tracking_log_name = strdup(file_name);
+
+	// Create/Open file and read contents
+	if ((file = fopen(f->tracking_log_name, "r")) == NULL) {
+		// If tracking log required to be present then return error
+		if (td->o.verify_track_required) {
+			log_err("Tracking log '%s' missing for job '%s' for file '%s''\n",
+				f->tracking_log_name, td->o.name, f->file_name);
+			ret = 1;
+			goto err2;
+		}
+		if ((file = fopen(f->tracking_log_name, "w+")) == NULL) {
+			log_err("fio: failed create of Tracking Log: %s\n", f->tracking_log_name);
+			perror("fio: create Tracking Log failed");
+			ret = errno;
+			goto err1;
+		}
+		// Return success on successful create
+		goto success;
+	}
+
+	// Let's read the tracking log just opened
+	// First record contains version and second record contains the tracking log checksum
+	if ((p = fgets(str, max_rec, file)) == NULL) {
+		log_err("fio: Missing version record in header for log: %s\n", f->tracking_log_name);
+		ret = errno;
+		goto err;
+	}
+	r = sscanf(p, "%256s %u", label, &version);
+	if (r != 2) {
+		log_err("fio: wrong number of fields in tracking log version record: %s\n", p);
+		ret = 1;
+		goto err;
+	}
+	if (strcmp(label, tracker_version_label)) {
+		log_err("fio: bad tracking log version label: file '%s' has '%s', expected: '%s'\n",
+			f->tracking_log_name, label, tracker_version_label);
+		ret = 1;
+		goto err;
+	}
+	if (version != tracker_log_version) {
+		log_err("fio: bad tracking log version: file '%s' has %d, expected: %d\n",
+			f->tracking_log_name, version, tracker_log_version);
+		ret = 1;
+		goto err;
+	}
+
+	if ((p = fgets(str, max_rec, file)) == NULL) {
+		log_err("fio: Missing filename record in header for log: %s\n", f->tracking_log_name);
+		ret = 1;
+		goto err;
+	}
+	r = sscanf(p, "%256s %s", label, str_file_name);
+	if (r != 2) {
+		log_err("fio: wrong number of fields in tracking log filename header record: %s\n", p);
+		ret = 1;
+		goto err;
+	}
+	if (strcmp(label, tracker_filename_label)) {
+		log_err("fio: bad tracking log filename label: file '%s' has '%s', expected: '%s'\n",
+			f->tracking_log_name, label, tracker_filename_label);
+		ret = 1;
+		goto err;
+	}
+
+	// Ideally real_file_size would be used to track the relationship between log and
+	// datafile but that can be quite large for a disk block device, resulting in
+	// a potentially huge array and log for a huge block device. Instead we track
+	// offset= and size= options and if either change the log is incompatible and
+	// we return an error.
+	if ((p = fgets(str, max_rec, file)) == NULL) {
+		log_err("fio: Missing file size record in header for log: %s\n", f->tracking_log_name);
+		ret = 1;
+		goto err;
+	}
+	r = sscanf(p, "%256s %"PRIu64"", label, &file_size);
+	if (r != 2) {
+		log_err("fio: wrong number of fields in tracking log file size header record: %s\n", p);
+		ret = 1;
+		goto err;
+	}
+	if (strcmp(label, tracker_size_label)) {
+		log_err("fio: bad tracking log file size label: file '%s' has '%s', expected: '%s'\n",
+			f->tracking_log_name, label, tracker_size_label);
+		ret = 1;
+		goto err;
+	}
+	if (file_size != f->io_size) {
+		log_err("fio: bad tracking log file Size: file '%s' has %"PRIu64", running job uses: %"PRIu64"\n",
+			f->tracking_log_name, file_size, f->io_size);
+		ret = 1;
+		goto err;
+	}
+
+	if ((p = fgets(str, max_rec, file)) == NULL) {
+		log_err("fio: Missing file offset record in header for log: %s\n", f->tracking_log_name);
+		ret = 1;
+		goto err;
+	}
+	r = sscanf(p, "%256s %"PRIu64"", label, &file_offset);
+	if (r != 2) {
+		log_err("fio: wrong number of fields in tracking log file offset header record: %s\n", p);
+		ret = 1;
+		goto err;
+	}
+	if (strcmp(label, tracker_offset_label)) {
+		log_err("fio: bad tracking log file offset label: file '%s' has '%s', expected: '%s'\n",
+			f->tracking_log_name, label, tracker_size_label);
+		ret = 1;
+		goto err;
+	}
+	if (file_offset != f->file_offset) {
+		log_err("fio: bad tracking log file Offset: file '%s' has %"PRIu64", running job uses: %"PRIu64"\n",
+			f->tracking_log_name, file_offset, f->file_offset);
+		ret = 1;
+		goto err;
+	}
+
+	if ((p = fgets(str, max_rec, file)) == NULL) {
+		log_err("fio: Missing interval record in header for log: %s\n", f->tracking_log_name);
+		ret = 1;
+		goto err;
+	}
+	r = sscanf(p, "%256s %u", label, &file_interval);
+	if (r != 2) {
+		log_err("fio: wrong number of fields in tracking log interval header record: %s\n", p);
+		ret = 1;
+		goto err;
+	}
+	if (strcmp(label, tracker_interval_label)) {
+		log_err("fio: bad tracking log interval label: file '%s' has '%s', expected: '%s'\n",
+			f->tracking_log_name, label, tracker_interval_label);
+		ret = 1;
+		goto err;
+	}
+	if (file_interval != td->o.verify_interval) {
+		log_err("fio: bad tracking log Interval: file '%s' has %u, running job uses: %u\n",
+			f->tracking_log_name, file_interval, td->o.verify_interval);
+		ret = 1;
+		goto err;
+	}
+
+	if ((p = fgets(str, max_rec, file)) == NULL) {
+		log_err("fio: Missing timestamp record in header for log: %s\n", f->tracking_log_name);
+		ret = 1;
+		goto err;
+	}
+	r = sscanf(p, "%256s %s", label, str_timestamp);
+	if (r != 2) {
+		log_err("fio: wrong number of fields in tracking log timestamp header record: %s\n", p);
+		ret = 1;
+		goto err;
+	}
+	if (strcmp(label, tracker_timestamp_label)) {
+		log_err("fio: bad tracking log timestamp label: file '%s' has '%s', expected: '%s'\n",
+			f->tracking_log_name, label, tracker_timestamp_label);
+		ret = 1;
+		goto err;
+	}
+
+	if ((p = fgets(str, max_rec, file)) == NULL) {
+		log_err("fio: Missing checksum record in header for log: %s\n", f->tracking_log_name);
+		ret = 1;
+		goto err;
+	}
+	r = sscanf(p, "%256s %x", label, &checksum);
+	if (r != 2) {
+		log_err("fio: wrong number of fields in tracking log checksum header record: %s\n", p);
+		ret = 1;
+		goto err;
+	}
+	if (strcmp(label, tracker_checksum_label)) {
+		log_err("fio: bad tracking log checksum label: file '%s' has '%s', expected: '%s'\n",
+			f->tracking_log_name, label, tracker_checksum_label);
+		ret = 1;
+		goto err;
+	}
+
+	if ((p = fgets(str, max_rec, file)) == NULL) {
+		log_err("fio: Missing verify interval checksums record in header for log: %s\n", f->tracking_log_name);
+		ret = 1;
+		goto err;
+	}
+	r = sscanf(p, "%256s", label);
+	if (r != 1) {
+		log_err("fio: wrong number of fields in tracking log verify interval checksums header record: %s\n", p);
+		ret = 1;
+		goto err;
+	}
+	if (strcmp(label, tracker_checksums_label)) {
+		log_err("fio: bad tracking log verify interval checksums label: file '%s' has '%s', expected: '%s'\n",
+			f->tracking_log_name, label, tracker_checksums_label);
+		ret = 1;
+		goto err;
+	}
+
+	reads = 0;
+	while ((p = fgets(str, max_rec, file)) != NULL) {
+
+		r = sscanf(p, "%x", &crc);
+		if (r != 1) {
+			log_err("fio: bad tracking log checksum record: %s\n", p);
+			ret = 1;
+			goto err;
+		}
+		if (!(entry_is_checksum(crc)) && !(entry_is_undefined(crc)) && !(entry_is_trimmed(crc))) {
+			log_err("fio: bad tracking log checksum: %x\n", crc);
+			ret = 1;
+			goto err;
+		}
+		f->tracking_array[reads] = crc;
+		reads++;
+	}
+
+	// Tracking log must have the exact number of entries for this file and block size
+	if (reads-1 != f->tracking_max) {
+		log_err("fio: bad tracking log, wrong number of records: file '%s' has %u recs, header expected: %u\n",
+			f->tracking_log_name, reads, f->tracking_max);
+		ret = 1;
+		goto err;
+	}
+	// Tracking log file checksum must match crc of the tracking array just read in
+	crc = fio_crc32c((void *)f->tracking_array, f->tracking_max * sizeof(uint32_t));
+	if (crc != checksum) {
+		log_err("fio: bad tracking log, checksum wrong: file '%s' records checksum to %x, header expected: %x\n",
+			f->tracking_log_name, crc, checksum);
+		ret = 1;
+		goto err;
+	}
+
+	// Finally close and delete the file so stale entries are never used.
+	dprint(FD_CHKSUM, "Successful Restore of tracking array for job '%s' for file '%s' from '%s'\n",
+		td->o.name, f->file_name, f->tracking_log_name);
+success:
+	fclose(file);
+	unlink(f->tracking_log_name);
+	return ret;
+err:
+	fclose(file);
+err1:
+	log_err("fio: No tracking array restored from tracking log: %s\n", f->tracking_log_name);
+	log_err("To discard tracking checksum expectations on restart, first delete: %s\n", f->tracking_log_name);
+err2:
+	f->tracking_log_name = NULL;
+	td_verror(td, ret,"restore_tracking_array");
+	return ret;
+}
+
+// Write this file's tracking array to tracking log on disk
+int verify_save_tracking_array(struct thread_data *td) {
+
+	struct fio_file *f = NULL;
+	unsigned int i = 0;
+	FILE *file = NULL;
+	uint32_t crc;
+	int ret = 0;
+	char timestamp[64];
+	struct timeval tv;
+
+	for_each_file(td, f, i) {
+		// Verify tracking array exists
+		if (f->tracking_array == NULL) {
+			log_err("fio: No tracking array exists to save for file: %s\n", f->file_name);
+			ret = 1;
+			goto no_close1;
+		}
+
+		if (f->tracking_log_name == NULL) continue;
+
+		if ((file = fopen(f->tracking_log_name, "w")) == NULL) {
+			perror("fio: failed to open Tracking Log");
+			ret = errno;
+			goto no_close;
+		}
+
+		// Tracking log header: 1) version rec 2) checksum rec 3) file size rec 4) verify interval rec
+		// Finally write tracking array of checksums to tracking log file
+		crc = fio_crc32c((void *)f->tracking_array, f->tracking_max * sizeof(uint32_t));
+
+		if (fprintf(file, "%s %u\n", tracker_version_label, tracker_log_version) < 0) {
+			perror("fio: failed to write version header record to tracking log");
+			ret = errno;
+			goto err;
+		}
+		if (fprintf(file, "%s %s\n", tracker_filename_label, f->file_name) < 0) {
+			perror("fio: failed to write filename header record to tracking log");
+			ret = errno;
+			goto err;
+		}
+		if (fprintf(file, "%s %"PRIu64"\n", tracker_size_label, f->io_size) < 0) {
+			perror("fio: failed to write file size header record to tracking log");
+			ret = errno;
+			goto err;
+		}
+		if (fprintf(file, "%s %"PRIu64"\n", tracker_offset_label, f->file_offset) < 0) {
+			perror("fio: failed to write file offset header record to tracking log");
+			ret = errno;
+			goto err;
+		}
+		if (fprintf(file, "%s %u\n", tracker_interval_label, td->o.verify_interval) < 0) {
+			perror("fio: failed to write interval header record to tracking log");
+			ret = errno;
+			goto err;
+		}
+		gettimeofday(&tv, NULL);
+		strftime(timestamp, sizeof(timestamp), "%Y-%m-%dT%H:%M:%S", localtime(&tv.tv_sec));
+		if (fprintf(file, "%s %s.%06lu\n", tracker_timestamp_label, timestamp, (long int)tv.tv_usec) < 0) {
+			perror("fio: failed to write timestamp header record to tracking log");
+			ret = errno;
+			goto err;
+		}
+		if (fprintf(file, "%s %x\n", tracker_checksum_label, crc) < 0) {
+			perror("fio: failed to write checksum header record to tracking log");
+			ret = errno;
+			goto err;
+		}
+		if (fprintf(file, "%s\n", tracker_checksums_label) < 0) {
+			perror("fio: failed to write verify interval checksums header record to tracking log");
+			ret = errno;
+			goto err;
+		}
+
+		for (int i = 0; i <= f->tracking_max; i++) {
+			if (fprintf(file, "%x\n", f->tracking_array[i]) < 0) {
+				perror("fio: failed to write checksum record to tracking log");
+				ret = errno;
+				goto err;
+			}
+		}
+		fclose(file);
+		memset(f->tracking_array, 0, f->tracking_max * sizeof(uint32_t));
+		dprint(FD_CHKSUM, "Successful Save of tracking array for file '%s' to %s\n",
+			f->file_name, f->tracking_log_name);
+		continue;
+	err:
+		fclose(file);
+		unlink(f->tracking_log_name);
+	no_close:
+		log_err("fio: failed to save tracking log for file '%s' to %s\n", f->file_name, f->tracking_log_name);
+	no_close1:
+		td_verror(td, ret,"verify_save_tracking_array");
+		return ret;
+	}
+	return ret;
+}
+
+/*
+ * Allocate tracking array enough to accommodate all verify_interval blocks
+ */
+int verify_allocate_tracking(struct thread_data *td) {
+	struct fio_file *f = NULL;
+	unsigned int i = 0, block_size;
+	uint64_t num_entries, bytes;
+	int ret = 0;
+
+	// verify_track only works if there is one I/O outstanding against a block at a time.
+	// verify_backlog performs write verification inline and thus there may be multiple
+	// I/Os outstanding against the same block. While the verifying read must wait for the
+	// preceding write to complete, once the verifying read queues, another write can come
+	// along on that block changing the expected checksum. If the read complete before
+	// the write the read contents can reflect the prior write's header. With verify_backlog
+	// disabled, a close and open of the file separates verifying reads from any new writes.
+	// write verification reads occurs at the end of each pass. Note this is not a concern
+	// if io_depth=1. Similarly randommap is required which guarantees single accessor
+	// of each block when random access is used. Like wise verify_aync is not supported
+	// with verify_track, nor can you set numjobs > 1.
+	//
+	if (td->o.verify_backlog && (td->o.iodepth > 1)) {
+		log_err("fio: verify_backlog not supported with verify_track when io_depth > 1\n");
+		return 1;
+	}
+	if (td->o.norandommap) {
+		log_err("fio: verify_track requires use of randommap which is disabled\n");
+		return 1;
+	}
+	if (td->o.softrandommap) {
+		log_err("fio: softrandommap not supported with verify_track\n");
+		return 1;
+	}
+	if (td->o.verify_async) {
+		log_err("fio: verify_async not supported with verify_track\n");
+		return 1;
+	}
+	if (td->o.numjobs > 1) {
+		log_err("fio: numjobs not supported with verify_track\n");
+		return 1;
+	}
+
+	// Its required that file size be an even multiple of block size when iodepth > 1 to guarantee
+	// the file is closed/flushed before verification in backend.c:do_io. Otherwise the randommap will
+	// automatically wrap and we can again have multiple accessors of a block.
+	block_size = td_min_bs(td);
+	if ((td->o.size % block_size) && (td->o.iodepth > 1)) {
+		log_err(
+			"fio: verify_track requires file to be even multiple of min block size, suggested size: %llu bytes\n",
+			(td->o.size / block_size) * block_size);
+		log_err("fio: file size: %llu, min block size: %d\n", td->o.size, block_size);
+		return 1;
+	}
+	// lfsr random generator does not guarantee single accessor when multiple blocks sizes are used.
+	if ((td->o.random_generator == FIO_RAND_GEN_LFSR) && (td_min_bs(td) != td_max_bs(td))) {
+		log_err("fio: lfsr random generator not supported with verify_track and multiple block sizes\n");
+		return 1;
+	}
+
+	// File sharing by threads within a fio job is supported but not between jobs running concurrently.
+	// If not the first thread then --stonewall option must be selected.
+	if ((td->thread_number > 1) && (!td->o.stonewall)) {
+		log_err("fio: file sharing between concurrent fio jobs is unsupported with verify_track, "
+				"every job after the first job should use --stonewall\n");
+		return 1;
+	}
+	// If trims are present then hard wire verify_track_trim_zero to true.
+	if (td_trim(td)) {
+		td->o.verify_track_trim_zero = 1;
+	}
+	// Tracking requires that a header be present which is not the case for VERIFY_PATTERN_NO_HDR.
+	// In this case verification checks all bytes of a block so checksums are not really needed.
+	// However tracking change over time without a header would be useful and could be added in future.
+	if (td->o.verify == VERIFY_PATTERN_NO_HDR) {
+		log_err("fio: verify=pattern is not supported with verify_track\n");
+		return 1;
+	}
+	// verify=null skips updates to the tracking array and is thus not supported
+	if (td->o.verify == VERIFY_NULL) {
+		log_err("fio: verify=null is not supported with verify_track\n");
+		return 1;
+	}
+	// verify_only is not supported, checksum is better version control than good numberio
+	// Support is hard as assert guaranteeing write/trim entry exists in verify_io_u fire.
+	// Fixable but not worth the complication.
+	if (td->o.verify_only) {
+		log_err("fio: verify_only is not supported with verify_track\n");
+		return 1;
+	}
+	// Offline I/O submit mode doesn't track when finished with a pass of the file and
+	// perform verification after a file close in backend.c:do_io() so not supported.
+	if (td->o.io_submit_mode != IO_MODE_INLINE) {
+		log_err("fio: submit_mode must be 'inline' with verify_track\n");
+		return 1;
+	}
+	// Using a sequence number modifier on the rw option risks concurrent I/O.
+	if (td->o.ddir_seq_add) {
+		log_err("fio: Using sequencer number with the rw option is not supported with verify_track\n");
+		return 1;
+	}
+	// experimental_verify not supported with verify_track
+	if (td->o.experimental_verify) {
+		log_err("fio: experimental_verify not supported with verify_track\n");
+		return 1;
+	}
+
+	for_each_file(td, f, i) {
+
+		if (f->tracking_array == NULL) {
+			num_entries = ((f->io_size / td->o.verify_interval) + 1);
+			bytes = num_entries * sizeof(uint32_t);
+			f->tracking_array = malloc(bytes);
+			if (!f->tracking_array) {
+				log_err("fio: cannot allocate verify tracking table of size: %"PRIu64" bytes for file: %s\n",
+					bytes, f->file_name);
+				return 1;
+			}
+			memset(f->tracking_array, TRACKING_UNDEFINED, bytes);
+			f->tracking_max = num_entries - 1;
+			if ((ret = restore_tracking_array(td, f))) return ret;
+		}
+	}
+	return 0;
 }
 
 /*
@@ -806,11 +1528,54 @@ static int verify_trimmed_io_u(struct thread_data *td, struct io_u *io_u)
 
 	mem_is_zero_slow(io_u->buf, io_u->buflen, &offset);
 
-	log_err("trim: verify failed at file %s offset %llu, length %lu"
-		", block offset %lu\n",
+	log_err("trim: all zeroes verify failed at file %s offset %llu, length %lu"
+			", block offset %lu\n",
 			io_u->file->file_name, io_u->offset, io_u->buflen,
 			(unsigned long) offset);
+	// Dump the entire buffer we just read off disk
+	dump_buf(io_u->buf, io_u->buflen, io_u->offset, "complete", io_u->file);
 	return EILSEQ;
+}
+
+//
+// Verify Trimmed block
+// If check_buf_only set then determine if buffer is all zeros
+//						 else log corruption if buffer is not all zeros
+static int verify_io_u_trimmed(struct thread_data *td, struct io_u *io_u,
+							   void * buf, unsigned int buflen, int check_buf_only)
+{
+	size_t offset;
+	int ret;
+
+	if (mem_is_zero(buf, buflen))
+		ret = 0;
+	else {
+		mem_is_zero_slow(buf, buflen, &offset);
+		ret = EILSEQ;
+	}
+
+	if (!ret) {
+		if (!check_buf_only) {
+			/* Report tracking array activity in this case for a trim:
+			   "VT" for trim I/O read that verifies against pre-existing array checksum
+			   and first value is file offset to the block used for this buffer,
+			   u=microseconds when block verified. t=constant used for trimmed blocks */
+			dprint(FD_CHKSUM, "VT:%llu u:%lu t:%08x\n", io_u->offset,
+				  ((io_u->start_time.tv_sec * 1000000) + io_u->start_time.tv_usec),
+				  TRACKING_TRIMMED);
+		}
+		return 0;
+	}
+
+	if (!check_buf_only) {
+		log_err("trim-zeroed: all zeroes verify failed at file %s offset %llu, length %lu"
+				", block offset %lu\n",
+				io_u->file->file_name, io_u->offset, io_u->buflen,
+				(unsigned long) (offset));
+		// * Dump the entire buffer we just read off disk
+		dump_buf(io_u->buf, io_u->buflen, io_u->offset, "complete", io_u->file);
+	}
+	return ret;
 }
 
 static int verify_header(struct io_u *io_u, struct thread_data *td,
@@ -846,13 +1611,16 @@ static int verify_header(struct io_u *io_u, struct thread_data *td,
 	/*
 	 * For read-only workloads, the program cannot be certain of the
 	 * last numberio written to a block. Checking of numberio will be
-	 * done only for workloads that write data.  For verify_only,
-	 * numberio will be checked in the last iteration when the correct
-	 * state of numberio, that would have been written to each block
-	 * in a previous run of fio, has been reached.
+	 * done only for workloads that write data. Similarly for non-verification
+	 * read I/Os, if using the tracking array to check validity
+	 * then skip numberio check as we have no stored numberio state.
+	 * Tracking checksum supercedes numberio check in this case.
+	 * For verify_only, numberio will be checked in the last iteration
+	 * when the correct state of numberio, that would have been written
+	 * to each block in a previous run of fio, has been reached.
 	 */
-	if (td_write(td) && (td_min_bs(td) == td_max_bs(td)) &&
-	    !td->o.time_based)
+	if (!td_single_ddir(td, DDIR_READ) && (td_min_bs(td) == td_max_bs(td)) &&
+		!td->o.time_based && (io_u->flags & IO_U_F_VER_LIST))
 		if (!td->o.verify_only || td->o.loops == 0)
 			if (hdr->numberio != io_u->numberio) {
 				log_err("verify: bad header numberio %"PRIu16
@@ -873,21 +1641,124 @@ err:
 	log_err(" at file %s offset %llu, length %u\n",
 		io_u->file->file_name,
 		io_u->offset + hdr_num * hdr_len, hdr_len);
-
-	if (td->o.verify_dump)
-		dump_buf(p, hdr_len, io_u->offset + hdr_num * hdr_len,
-				"hdr_fail", io_u->file);
+	dump_received_buffer(td, io_u, hdr, hdr_num, hdr_len);
 
 	return EILSEQ;
 }
 
+// Validated expected on-disk verify format
+static int validate_expected_format(struct vcont *vc)
+{
+	struct verify_header *hdr = vc->hdr;
+	struct thread_data *td = vc->td;
+	struct io_u *io_u = vc->io_u;
+	int ret;
+	unsigned int header_size, verify_type;
+
+
+	// Now lets perform check of verify on-disk format
+	// First perform any requested header swap
+	header_size = __hdr_size(td->o.verify);
+	if (td->o.verify_offset)
+		memswp(hdr, hdr + td->o.verify_offset, header_size);
+
+	/*
+	 * Make rand_seed check pass when have verifysort or
+	 * verify_backlog or tracking is on.
+	 */
+	if (td->o.verifysort || (td->flags & TD_F_VER_BACKLOG) ||
+		td->o.verify_track)
+		io_u->rand_seed = hdr->rand_seed;
+
+	if (td->o.verify != VERIFY_PATTERN_NO_HDR) {
+		ret = verify_header(io_u, td, hdr, vc->hdr_num, vc->hdr_inc);
+		if (ret)
+			return ret;
+	}
+
+	if (td->o.verify != VERIFY_NONE)
+		verify_type = td->o.verify;
+	else
+		verify_type = hdr->verify_type;
+
+		switch (verify_type) {
+		case VERIFY_HDR_ONLY:
+			/* Header is always verified, check if pattern is left
+			 * for verification. */
+			if (td->o.verify_pattern_bytes)
+				ret = verify_io_u_pattern(hdr, vc);
+			break;
+		case VERIFY_MD5:
+			ret = verify_io_u_md5(hdr, vc);
+			break;
+		case VERIFY_CRC64:
+			ret = verify_io_u_crc64(hdr, vc);
+			break;
+		case VERIFY_CRC32C:
+		case VERIFY_CRC32C_INTEL:
+			ret = verify_io_u_crc32c(hdr, vc);
+			break;
+		case VERIFY_CRC32:
+			ret = verify_io_u_crc32(hdr, vc);
+			break;
+		case VERIFY_CRC16:
+			ret = verify_io_u_crc16(hdr, vc);
+			break;
+		case VERIFY_CRC7:
+			ret = verify_io_u_crc7(hdr, vc);
+			break;
+		case VERIFY_SHA256:
+			ret = verify_io_u_sha256(hdr, vc);
+			break;
+		case VERIFY_SHA512:
+			ret = verify_io_u_sha512(hdr, vc);
+			break;
+		case VERIFY_SHA3_224:
+			ret = verify_io_u_sha3_224(hdr, vc);
+			break;
+		case VERIFY_SHA3_256:
+			ret = verify_io_u_sha3_256(hdr, vc);
+			break;
+		case VERIFY_SHA3_384:
+			ret = verify_io_u_sha3_384(hdr, vc);
+			break;
+		case VERIFY_SHA3_512:
+			ret = verify_io_u_sha3_512(hdr, vc);
+			break;
+		case VERIFY_XXHASH:
+			ret = verify_io_u_xxhash(hdr, vc);
+			break;
+		case VERIFY_SHA1:
+			ret = verify_io_u_sha1(hdr, vc);
+			break;
+		case VERIFY_PATTERN:
+		case VERIFY_PATTERN_NO_HDR:
+			ret = verify_io_u_pattern(hdr, vc);
+			break;
+	default:
+		log_err("Bad verify type %u\n", hdr->verify_type);
+		ret = EINVAL;
+	}
+
+	if (ret && verify_type != hdr->verify_type)
+		log_err("fio: verify type mismatch (%u media, %u given)\n",
+				hdr->verify_type, verify_type);
+
+	if (!ret) {
+		if (td->o.verify_track && (td->o.verify != VERIFY_PATTERN_NO_HDR)) {
+			ret = _verify_tracking(td, io_u, hdr, vc->hdr_num, vc->hdr_inc);
+		}
+	}
+	return ret;
+}
+
 int verify_io_u(struct thread_data *td, struct io_u **io_u_ptr)
 {
-	struct verify_header *hdr;
 	struct io_u *io_u = *io_u_ptr;
-	unsigned int header_size, hdr_inc, hdr_num = 0;
+	unsigned int hdr_inc, hdr_num;
 	void *p;
-	int ret;
+	int ret, defined, undefined;
+	uint32_t tracking_entry;
 
 	if (td->o.verify == VERIFY_NULL || io_u->ddir != DDIR_READ)
 		return 0;
@@ -905,104 +1776,80 @@ int verify_io_u(struct thread_data *td, struct io_u **io_u_ptr)
 
 	hdr_inc = get_hdr_inc(td, io_u);
 
-	ret = 0;
+	// For each verify_interval block
+	defined = undefined = ret = hdr_num = 0;
 	for (p = io_u->buf; p < io_u->buf + io_u->buflen;
-	     p += hdr_inc, hdr_num++) {
+		 p += hdr_inc, hdr_num++) {
 		struct vcont vc = {
 			.io_u		= io_u,
 			.hdr_num	= hdr_num,
-			.td		= td,
+			.hdr_inc	= hdr_inc,
+			.hdr		= p,
+			.td			= td,
 		};
-		unsigned int verify_type;
 
 		if (ret && td->o.verify_fatal)
 			break;
 
-		header_size = __hdr_size(td->o.verify);
-		if (td->o.verify_offset)
-			memswp(p, p + td->o.verify_offset, header_size);
-		hdr = p;
-
-		/*
-		 * Make rand_seed check pass when have verifysort or
-		 * verify_backlog.
-		 */
-		if (td->o.verifysort || (td->flags & TD_F_VER_BACKLOG))
-			io_u->rand_seed = hdr->rand_seed;
-
-		if (td->o.verify != VERIFY_PATTERN_NO_HDR) {
-			ret = verify_header(io_u, td, hdr, hdr_num, hdr_inc);
-			if (ret)
-				return ret;
+		// If tracking on, use tracking array to determine type of verification format
+		if (td->o.verify_track) {
+			// Get tracking array entry
+			// If trim verify:
+			//	 Assert if entry not trimmed state
+			//	 Verify trimmed verify_interval block
+			tracking_entry = get_tracking_entry(td, io_u, hdr_num, hdr_inc);
+			if (is_trim_verify) {
+				assert (tracking_entry == TRACKING_TRIMMED);
+				ret = verify_io_u_trimmed(td, io_u, p, hdr_inc, 0);
+				continue;
+			// If Write verify:
+			//	 Assert if entry not defined checksum
+			//	 Fall through to check on-disk verify format
+			} else if (is_write_verify) {
+				assert (tracking_entry & TRACKING_EXISTS);
+			// If Read Verify:
+			//	 Assert if block's tracking entries are not all undefined or all defined (checksum/trim)
+			//	 If entry == Trim:
+			//		 Verify trimmed verify_interval block
+			//	 If entry == undefined:
+			//		 When tracking file for the first time, all verify_interval blocks must be zeroed or use on-disk
+			//		 verify format.
+			//		 If block is all zeroes:
+			//			then if verify_track_trim_zero set then Track as good trim
+			//										 	   else Fall through and treat as corruption
+			//			else Fall through and check for presence of on-disk verify format
+			//	 If entry == checksum:
+			//		 Fall through to check on-disk verify format
+			} else { // Assuming this is a read verification
+				if (entry_is_trimmed(tracking_entry)) {
+					assert (!undefined); // Block's tracking array entries must all be defined
+					defined = 1;
+					ret = verify_io_u_trimmed(td, io_u, p, hdr_inc, 0);
+					continue;
+				} else if (entry_is_undefined(tracking_entry)) {
+					assert (!defined); // Block's tracking array entries must all be undefined
+					undefined = 1;
+					if (!verify_io_u_trimmed(td, io_u, p, hdr_inc, 1)) {
+						// Block is all zeroes and if verify_track_trim_zero set then track as good trim
+						// else fall through and treat as corruption
+						if (td->o.verify_track_trim_zero) {
+							save_tracking_trimmed(td, io_u, hdr_num, hdr_inc);
+							continue;
+						}
+					}
+				} else if (entry_is_checksum(tracking_entry)) {
+					assert (!undefined); // Block's tracking array entries must all be defined
+					defined = 1;
+				} else assert(0); // Unknown tracking entry
+			}
+		// Else tracking not enabled so deal with trim or fall through to check on-disk verify format
+		} else if (is_trim_verify) {
+			assert(0); // Not possible as only verify trims if tracking is on.
+			continue;
 		}
 
-		if (td->o.verify != VERIFY_NONE)
-			verify_type = td->o.verify;
-		else
-			verify_type = hdr->verify_type;
-
-		switch (verify_type) {
-		case VERIFY_HDR_ONLY:
-			/* Header is always verified, check if pattern is left
-			 * for verification. */
-			if (td->o.verify_pattern_bytes)
-				ret = verify_io_u_pattern(hdr, &vc);
-			break;
-		case VERIFY_MD5:
-			ret = verify_io_u_md5(hdr, &vc);
-			break;
-		case VERIFY_CRC64:
-			ret = verify_io_u_crc64(hdr, &vc);
-			break;
-		case VERIFY_CRC32C:
-		case VERIFY_CRC32C_INTEL:
-			ret = verify_io_u_crc32c(hdr, &vc);
-			break;
-		case VERIFY_CRC32:
-			ret = verify_io_u_crc32(hdr, &vc);
-			break;
-		case VERIFY_CRC16:
-			ret = verify_io_u_crc16(hdr, &vc);
-			break;
-		case VERIFY_CRC7:
-			ret = verify_io_u_crc7(hdr, &vc);
-			break;
-		case VERIFY_SHA256:
-			ret = verify_io_u_sha256(hdr, &vc);
-			break;
-		case VERIFY_SHA512:
-			ret = verify_io_u_sha512(hdr, &vc);
-			break;
-		case VERIFY_SHA3_224:
-			ret = verify_io_u_sha3_224(hdr, &vc);
-			break;
-		case VERIFY_SHA3_256:
-			ret = verify_io_u_sha3_256(hdr, &vc);
-			break;
-		case VERIFY_SHA3_384:
-			ret = verify_io_u_sha3_384(hdr, &vc);
-			break;
-		case VERIFY_SHA3_512:
-			ret = verify_io_u_sha3_512(hdr, &vc);
-			break;
-		case VERIFY_XXHASH:
-			ret = verify_io_u_xxhash(hdr, &vc);
-			break;
-		case VERIFY_SHA1:
-			ret = verify_io_u_sha1(hdr, &vc);
-			break;
-		case VERIFY_PATTERN:
-		case VERIFY_PATTERN_NO_HDR:
-			ret = verify_io_u_pattern(hdr, &vc);
-			break;
-		default:
-			log_err("Bad verify type %u\n", hdr->verify_type);
-			ret = EINVAL;
-		}
-
-		if (ret && verify_type != hdr->verify_type)
-			log_err("fio: verify type mismatch (%u media, %u given)\n",
-					hdr->verify_type, verify_type);
+		// Must have expected non-zero on-disk format
+		ret = validate_expected_format(&vc);
 	}
 
 done:
@@ -1278,6 +2125,9 @@ static void populate_hdr(struct thread_data *td, struct io_u *io_u,
 		assert(0);
 	}
 
+	if (td->o.verify_track)
+		save_tracking(td, io_u, hdr, header_len);
+
 	if (td->o.verify_offset && hdr_size(td, hdr))
 		memswp(p, p + td->o.verify_offset, hdr_size(td, hdr));
 }
@@ -1347,6 +2197,10 @@ int get_next_verify(struct thread_data *td, struct io_u *io_u)
 
 		if (ipo->flags & IP_F_TRIMMED)
 			io_u_set(td, io_u, IO_U_F_TRIMMED);
+		if (ipo->flags & IP_F_TRIM_VER)
+			io_u_set(td, io_u, IO_U_F_TRIM_VER);
+		if (ipo->flags & IP_F_WRITE_VER)
+			io_u_set(td, io_u, IO_U_F_WRITE_VER);
 
 		if (!fio_file_open(io_u->file)) {
 			int r = td_io_open_file(td, io_u->file);

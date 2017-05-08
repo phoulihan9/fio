@@ -2,6 +2,7 @@
 #define FIO_FILE_H
 
 #include <string.h>
+#include <stdio.h>
 #include "compiler/compiler.h"
 #include "io_ddir.h"
 #include "flist.h"
@@ -148,7 +149,33 @@ struct fio_file {
 	enum fio_file_flags flags;
 
 	struct disk_util *du;
+
+	/*
+	 * Ptr to array used to track checksums of all reads/writes to protect
+	 * against older versions of block being returned. Array is sized
+	 * as (<filesize>/verify_interval) * 4. Each array entry maps to
+	 * a verify_interval block and contains the sum of the header crc32c
+	 * checksum and the first 4 bytes of the data checksum. If verify pattern
+	 * used with a header but no data checksum present then it is first four bytes
+	 * of data but all bytes of block are checked when pattern used
+	 * so data checksum not needed.
+	 * Bit 0 set in the entry indicates checksum exists
+	 * Entry value = TRACKING_UNDEFINED means no entry exists
+	 * Entry value = TRACKING_TRIMMED means block has been trimmed
+	*/
+	unsigned int *tracking_array;
+	unsigned int tracking_max;
+	char *tracking_log_name;
+
 };
+
+enum { TRACKING_EXISTS = 1};    // Bit 0 set means tracking checksum exists
+enum { TRACKING_UNDEFINED = 0}; // No checksum exists for this block
+enum { TRACKING_TRIMMED = 0xdddddddd & ~TRACKING_EXISTS};  // Block has been
+		// trimmed and read verification should return zeroes
+#define entry_is_checksum(entry)     (entry & TRACKING_EXISTS)
+#define entry_is_trimmed(entry)      (entry == TRACKING_TRIMMED)
+#define entry_is_undefined(entry)    (entry == TRACKING_UNDEFINED)
 
 #define FILE_ENG_DATA(f)		((f)->engine_data)
 #define FILE_SET_ENG_DATA(f, data)	((f)->engine_data = (data))

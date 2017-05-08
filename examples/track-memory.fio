@@ -1,0 +1,33 @@
+# track-memory.fio - turn on checksum tracking in memory only. Each job starts with an
+# empty tracking array. Once block is read or written, the checksum is stored in the array and
+# future read I/Os of the block in the job must agree with tracking array checksum. Each fio job
+# starts with an empty tracking array. Also includes example for using trims in mixed workload.
+
+[global]
+ioengine=libaio
+fallocate=0
+filename=/dev/sdb
+direct=1
+buffered=0
+iodepth=1
+bs=1m
+ba=1m
+verify_interval=1m
+size=100M
+fadvise_hint=0
+verify=crc32c
+verify_fatal=1
+verify_dump=1
+verify_track=1
+
+[Init]
+rw=randwrite
+
+[Run]
+# Trim of Linux block devices are dependent on I/O size. VMWARE only allows trims if I/O size
+# is at least 1M and VM hardware level is at least 11 (see vSphere VM setting). Note
+# you need privilege to write a Linux block device.
+rw=rwt
+rwtmix=34,33,33
+stonewall
+

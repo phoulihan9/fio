@@ -276,7 +276,7 @@ static void cleanup_pending_aio(struct thread_data *td)
  * Helper to handle the final sync of a file. Works just like the normal
  * io path, just does everything sync.
  */
-static bool fio_io_sync(struct thread_data *td, struct fio_file *f)
+bool fio_io_sync(struct thread_data *td, struct fio_file *f)
 {
 	struct io_u *io_u = __get_io_u(td);
 	int ret;
@@ -367,9 +367,6 @@ static inline void update_runtime(struct thread_data *td,
 				  unsigned long long *elapsed_us,
 				  const enum fio_ddir ddir)
 {
-	if (ddir == DDIR_WRITE && td_write(td) && td->o.verify_only)
-		return;
-
 	td->ts.runtime[ddir] -= (elapsed_us[ddir] + 999) / 1000;
 	elapsed_us[ddir] += utime_since_now(&td->start);
 	td->ts.runtime[ddir] += (elapsed_us[ddir] + 999) / 1000;
@@ -465,6 +462,8 @@ int io_queue_event(struct thread_data *td, struct io_u *io_u, int *ret,
 		   struct timeval *comp_time)
 {
 	int ret2;
+	if (bytes_issued)
+		*bytes_issued = 0;
 
 	switch (*ret) {
 	case FIO_Q_COMPLETED:
@@ -476,7 +475,7 @@ int io_queue_event(struct thread_data *td, struct io_u *io_u, int *ret,
 			struct fio_file *f = io_u->file;
 
 			if (bytes_issued)
-				*bytes_issued += bytes;
+				*bytes_issued = bytes;
 
 			if (!from_verify)
 				trim_io_piece(td, io_u);
@@ -505,6 +504,10 @@ int io_queue_event(struct thread_data *td, struct io_u *io_u, int *ret,
 
 			requeue_io_u(td, &io_u);
 		} else {
+			if (io_u->ddir == DDIR_TRIM) {
+				if (bytes_issued)
+					*bytes_issued = io_u->xfer_buflen;
+			}
 sync_done:
 			if (comp_time && (__should_check_rate(td, DDIR_READ) ||
 			    __should_check_rate(td, DDIR_WRITE) ||
@@ -536,7 +539,7 @@ sync_done:
 		if (td->io_ops->commit == NULL)
 			io_u_queued(td, io_u);
 		if (bytes_issued)
-			*bytes_issued += io_u->xfer_buflen;
+			*bytes_issued = io_u->xfer_buflen;
 		break;
 	case FIO_Q_BUSY:
 		if (!from_verify)
@@ -765,16 +768,17 @@ static bool exceeds_number_ios(struct thread_data *td)
 
 static bool io_bytes_exceeded(struct thread_data *td, uint64_t *this_bytes)
 {
-	unsigned long long bytes, limit;
+	unsigned long long bytes = 0, limit;
 
-	if (td_rw(td))
-		bytes = this_bytes[DDIR_READ] + this_bytes[DDIR_WRITE];
-	else if (td_write(td))
-		bytes = this_bytes[DDIR_WRITE];
-	else if (td_read(td))
-		bytes = this_bytes[DDIR_READ];
-	else
-		bytes = this_bytes[DDIR_TRIM];
+	if (td_write(td))
+		bytes += this_bytes[DDIR_WRITE];
+	if (td_read(td))
+		// Don't count read bytes from verify reads
+		bytes += (this_bytes[DDIR_READ] - td->io_issue_verify_bytes);
+	// trimwrite is sequential trim followed by write to same block
+	// so only count writes in this case and not the trims
+	if (td_trim(td) && !td_trim_and_write(td))
+		bytes += this_bytes[DDIR_TRIM];
 
 	if (td->o.io_size)
 		limit = td->o.io_size;
@@ -838,7 +842,7 @@ static void do_io(struct thread_data *td, uint64_t *bytes_done)
 {
 	unsigned int i;
 	int ret = 0;
-	uint64_t total_bytes, bytes_issued = 0;
+	uint64_t bytes, total_bytes, bytes_issued = 0;
 
 	for (i = 0; i < DDIR_RWDIR_CNT; i++)
 		bytes_done[i] = td->bytes_done[i];
@@ -852,24 +856,19 @@ static void do_io(struct thread_data *td, uint64_t *bytes_done)
 
 	total_bytes = td->o.size;
 	/*
-	* Allow random overwrite workloads to write up to io_size
+	* Allow random overwrite/trim workloads to write up to io_limit
 	* before starting verification phase as 'size' doesn't apply.
+	* verify_track relies on total bytes stopping when o.size is hit.
+	* Not a problem for verify_track as tracking not supported
+	* when norandommap is on.
 	*/
-	if (td_write(td) && td_random(td) && td->o.norandommap)
+	if ((td_write(td) || td_trim(td)) && td_random(td) && td->o.norandommap)
 		total_bytes = max(total_bytes, (uint64_t) td->o.io_size);
-	/*
-	 * If verify_backlog is enabled, we'll run the verify in this
-	 * handler as well. For that case, we may need up to twice the
-	 * amount of bytes.
-	 */
-	if (td->o.verify != VERIFY_NONE &&
-	   (td_write(td) && td->o.verify_backlog))
-		total_bytes += td->o.size;
 
-	/* In trimwrite mode, each byte is trimmed and then written, so
+	/* In trim & write mode, each byte is trimmed and then written, so
 	 * allow total_bytes to be twice as big */
-	if (td_trimwrite(td))
-		total_bytes += td->total_io_size;
+	if (td_trim_and_write(td))
+		total_bytes += td->o.size;
 
 	while ((td->o.read_iolog_file && !flist_empty(&td->io_log_list)) ||
 		(!flist_empty(&td->trim_list)) || !io_issue_bytes_exceeded(td) ||
@@ -902,6 +901,7 @@ static void do_io(struct thread_data *td, uint64_t *bytes_done)
 		 * based runs, but we still need to break out of the loop
 		 * for those to run verification, if enabled.
 		 */
+		//dprint(FD_IO, "Issued: %"PRIu64", Total: %"PRIu64"\n",bytes_issued, total_bytes);
 		if (bytes_issued >= total_bytes &&
 		    (!td->o.time_based ||
 		     (td->o.time_based && td->o.verify != VERIFY_NONE)))
@@ -925,11 +925,12 @@ static void do_io(struct thread_data *td, uint64_t *bytes_done)
 
 		/*
 		 * Add verification end_io handler if:
-		 *	- Asked to verify (!td_rw(td))
-		 *	- Or the io_u is from our verify list (mixed write/ver)
+		 *	- Verification enabled and
+		 *	- This io_u is a read from our verify list (backlog read verify)
+		 *	- Or we are in read only mode
 		 */
-		if (td->o.verify != VERIFY_NONE && io_u->ddir == DDIR_READ &&
-		    ((io_u->flags & IO_U_F_VER_LIST) || !td_rw(td))) {
+		if (td->o.verify != VERIFY_NONE &&
+			((io_u->flags & IO_U_F_VER_LIST) || td_single_ddir(td, DDIR_READ))) {
 
 			if (!td->o.verify_pattern_bytes) {
 				io_u->rand_seed = __rand(&td->verify_state);
@@ -947,19 +948,26 @@ static void do_io(struct thread_data *td, uint64_t *bytes_done)
 			else
 				io_u->end_io = verify_io_u;
 			td_set_runstate(td, TD_VERIFYING);
-		} else if (in_ramp_time(td))
-			td_set_runstate(td, TD_RAMP);
-		else
-			td_set_runstate(td, TD_RUNNING);
+
+		} else {
+			// If read and verify tracking is on then verify all reads
+			// verify tracking implies o.verify is set and verify_async is off
+			// rand_seed setup unnecessary as superseded by CRC tracking
+			if (tracking_enabled(td) && (io_u->ddir == DDIR_READ)) {
+				io_u->end_io = verify_io_u;
+			}
+			if (in_ramp_time(td))
+				td_set_runstate(td, TD_RAMP);
+			else
+				td_set_runstate(td, TD_RUNNING);
+		}
 
 		/*
 		 * Always log IO before it's issued, so we know the specific
 		 * order of it. The logged unit will track when the IO has
 		 * completed.
 		 */
-		if (td_write(td) && io_u->ddir == DDIR_WRITE &&
-		    td->o.do_verify &&
-		    td->o.verify != VERIFY_NONE &&
+		if (verifiable_io(td, io_u) &&
 		    !td->o.experimental_verify)
 			log_io_piece(td, io_u);
 
@@ -977,6 +985,8 @@ static void do_io(struct thread_data *td, uint64_t *bytes_done)
 				td->io_issues[ddir]++;
 				td->io_issue_bytes[ddir] += blen;
 				td->rate_io_issue_bytes[ddir] += blen;
+				if (io_u->flags & IO_U_F_VER_LIST)
+					td->io_issue_verify_bytes += blen;
 			}
 
 			if (should_check_rate(td))
@@ -988,8 +998,11 @@ static void do_io(struct thread_data *td, uint64_t *bytes_done)
 			if (should_check_rate(td))
 				td->rate_next_io_time[ddir] = usec_for_io(td, ddir);
 
-			if (io_queue_event(td, io_u, &ret, ddir, &bytes_issued, 0, &comp_time))
+			if (io_queue_event(td, io_u, &ret, ddir, &bytes, 0, &comp_time))
 				break;
+
+			if (!(io_u->flags & IO_U_F_VER_LIST))
+				bytes_issued += bytes;
 
 			/*
 			 * See if we need to complete some commands. Note that
@@ -1156,7 +1169,7 @@ static int init_io_u(struct thread_data *td)
 	td->orig_buffer_size = (unsigned long long) max_bs
 					* (unsigned long long) max_units;
 
-	if (td_ioengine_flagged(td, FIO_NOIO) || !(td_read(td) || td_write(td)))
+	if (td_ioengine_flagged(td, FIO_NOIO) || !(td_read(td) || td_write(td) || td_trim(td)))
 		data_xfer = 0;
 
 	err = 0;
@@ -1428,9 +1441,10 @@ static uint64_t do_dry_run(struct thread_data *td)
 			td->ts.total_io_u[io_u->ddir]++;
 		}
 
-		if (td_write(td) && io_u->ddir == DDIR_WRITE &&
-		    td->o.do_verify &&
-		    td->o.verify != VERIFY_NONE &&
+		// TODO Setting verify_backlog could result in verify reads from get_io_u
+		// TODO that would not be performed when we fake completion and thus not all writes
+		// TODO would be verified in a dry run.
+		if (verifiable_io(td, io_u) &&
 		    !td->o.experimental_verify)
 			log_io_piece(td, io_u);
 
@@ -1644,6 +1658,9 @@ static void *thread_main(void *data)
 	if (!o->create_serialize && setup_files(td))
 		goto err;
 
+	if (tracking_enabled(td) && verify_allocate_tracking(td))
+		goto err;
+
 	if (td_io_init(td))
 		goto err;
 
@@ -1684,6 +1701,7 @@ static void *thread_main(void *data)
 
 	while (keep_running(td)) {
 		uint64_t verify_bytes;
+		int dry_run;
 
 		fio_gettime(&td->start, NULL);
 		memcpy(&td->tv_cache, &td->start, sizeof(td->start));
@@ -1697,7 +1715,9 @@ static void *thread_main(void *data)
 
 		prune_io_piece_log(td);
 
-		if (td->o.verify_only && td_write(td))
+		// Do dry run if verify_only is on and any form of write/trim.
+		dry_run = td->o.verify_only && !td_single_ddir(td, DDIR_READ);
+		if (dry_run)
 			verify_bytes = do_dry_run(td);
 		else {
 			do_io(td, bytes_done);
@@ -1741,20 +1761,21 @@ static void *thread_main(void *data)
 			}
 		} while (1);
 
-		if (td_read(td) && td->io_bytes[DDIR_READ])
-			update_runtime(td, elapsed_us, DDIR_READ);
-		if (td_write(td) && td->io_bytes[DDIR_WRITE])
-			update_runtime(td, elapsed_us, DDIR_WRITE);
-		if (td_trim(td) && td->io_bytes[DDIR_TRIM])
-			update_runtime(td, elapsed_us, DDIR_TRIM);
+		if (!dry_run) {
+			if (td_read(td) && td->io_bytes[DDIR_READ])
+				update_runtime(td, elapsed_us, DDIR_READ);
+			if (td_write(td) && td->io_bytes[DDIR_WRITE])
+				update_runtime(td, elapsed_us, DDIR_WRITE);
+			if (td_trim(td) && td->io_bytes[DDIR_TRIM])
+				update_runtime(td, elapsed_us, DDIR_TRIM);
+		}
 		fio_gettime(&td->start, NULL);
 		fio_mutex_up(stat_mutex);
 
 		if (td->error || td->terminate)
 			break;
 
-		if (!o->do_verify ||
-		    o->verify == VERIFY_NONE ||
+		if (!verify_enabled(td) ||
 		    td_ioengine_flagged(td, FIO_UNIDIR))
 			continue;
 
@@ -1823,6 +1844,8 @@ err:
 	if (o->verify_async)
 		verify_async_exit(td);
 
+	if (!td->error && tracking_enabled(td)) verify_save_tracking_array(td);
+
 	close_and_free_files(td);
 	cleanup_io_u(td);
 	close_ioengine(td);
@@ -1849,6 +1872,8 @@ err:
 	 */
 	if (o->write_iolog_file)
 		write_iolog_close(td);
+
+	if (fio_debug) log_info_flush();
 
 	td_set_runstate(td, TD_EXITED);
 
@@ -2060,7 +2085,7 @@ static bool check_mount_writes(struct thread_data *td)
 	struct fio_file *f;
 	unsigned int i;
 
-	if (!td_write(td) || td->o.allow_mounted_write)
+	if (!(td_write(td) || td_trim(td)) || td->o.allow_mounted_write)
 		return false;
 
 	/*
