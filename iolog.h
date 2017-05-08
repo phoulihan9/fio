@@ -187,6 +187,8 @@ enum {
 	IP_F_ONLIST	= 2,
 	IP_F_TRIMMED	= 4,
 	IP_F_IN_FLIGHT	= 8,
+	IP_F_TRIM_VER	=16,
+	IP_F_WRITE_VER	=32,
 };
 
 /*

@@ -25,7 +25,12 @@ enum {
 	IO_U_F_TRIMMED		= 1 << 5,
 	IO_U_F_BARRIER		= 1 << 6,
 	IO_U_F_VER_LIST		= 1 << 7,
+	IO_U_F_TRIM_VER		= 1 << 8,
+	IO_U_F_WRITE_VER	= 1 << 9,
 };
+
+#define is_write_verify (io_u->flags & IO_U_F_WRITE_VER)
+#define is_trim_verify  (io_u->flags & IO_U_F_TRIM_VER)
 
 /*
  * The io unit
@@ -151,13 +156,14 @@ int do_io_u_trim(const struct thread_data *, struct io_u *);
 static inline void dprint_io_u(struct io_u *io_u, const char *p)
 {
 	struct fio_file *f = io_u->file;
+	char none[] = "";
+	char * file = none;
 
-	dprint(FD_IO, "%s: io_u %p: off=%llu/len=%lu/ddir=%d", p, io_u,
-					(unsigned long long) io_u->offset,
-					io_u->buflen, io_u->ddir);
 	if (f)
-		dprint(FD_IO, "/%s", f->file_name);
-	dprint(FD_IO, "\n");
+		file = f->file_name;
+	dprint(FD_IO, "%s: io_u %p: off=%llu/len=%lu/ddir=%d/file=%s\n", p, io_u,
+					(unsigned long long) io_u->offset,
+					io_u->buflen, io_u->ddir, file);
 }
 #else
 #define dprint_io_u(io_u, p)

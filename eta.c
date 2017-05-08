@@ -7,6 +7,8 @@
 
 #include "fio.h"
 #include "lib/pow2.h"
+#include "io_ddir.h"
+#include "verify.h"
 
 static char __run_str[REAL_MAX_JOBS + 1];
 static char run_str[__THREAD_RUNSTR_SZ(REAL_MAX_JOBS)];
@@ -52,12 +54,14 @@ static void check_str_update(struct thread_data *td)
 		c = '/';
 		break;
 	case TD_RUNNING:
-		if (td_rw(td)) {
+		if (td_multiple_ddirs(td)) {
 			if (td_random(td)) {
 				if (td->o.rwmix[DDIR_READ] == 100)
 					c = 'r';
 				else if (td->o.rwmix[DDIR_WRITE] == 100)
 					c = 'w';
+				else if (td->o.rwmix[DDIR_TRIM] == 100)
+					c = 't';
 				else
 					c = 'm';
 			} else {
@@ -65,6 +69,8 @@ static void check_str_update(struct thread_data *td)
 					c = 'R';
 				else if (td->o.rwmix[DDIR_WRITE] == 100)
 					c = 'W';
+				else if (td->o.rwmix[DDIR_TRIM] == 100)
+					c = 'T';
 				else
 					c = 'M';
 			}
@@ -80,9 +86,9 @@ static void check_str_update(struct thread_data *td)
 				c = 'W';
 		} else {
 			if (td_random(td))
-				c = 'd';
+				c = 't';
 			else
-				c = 'D';
+				c = 'T';
 		}
 		break;
 	case TD_PRE_READING:
@@ -183,21 +189,29 @@ static unsigned long thread_eta(struct thread_data *td)
 	}
 
 	/*
-	 * if writing and verifying afterwards, bytes_total will be twice the
+	 * if writing or trimming and verifying afterwards, bytes_total will be twice the
 	 * size. In a mixed workload, verify phase will be the size of the
-	 * first stage writes.
+	 * first stage writes/trims.
 	 */
-	if (td->o.do_verify && td->o.verify && td_write(td)) {
-		if (td_rw(td)) {
-			unsigned int perc = 50;
-
-			if (td->o.rwmix[DDIR_WRITE])
+	if (verifiable_ddir(td)) {
+		unsigned int perc = 0;
+		if (verifiable_writes(td)) {
+			if (td_single_ddir(td, DDIR_WRITE)) {
+				perc = 100;
+			} else {
 				perc = td->o.rwmix[DDIR_WRITE];
-
-			bytes_total += (bytes_total * perc) / 100;
-		} else
-			bytes_total <<= 1;
+			}
+		}
+		if (verifiable_trims(td)) {
+			if (td_single_ddir(td, DDIR_TRIM)) {
+				perc = 100;
+			} else {
+				perc += td->o.rwmix[DDIR_TRIM];
+			}
+		}
+		bytes_total += (bytes_total * perc) / 100;
 	}
+
 
 	if (td->runstate == TD_RUNNING || td->runstate == TD_VERIFYING) {
 		double perc, perc_t;

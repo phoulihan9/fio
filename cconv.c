@@ -29,6 +29,7 @@ static void free_thread_options_to_cpu(struct thread_options *o)
 	free(o->name);
 	free(o->wait_for);
 	free(o->directory);
+	free(o->verify_track_dir);
 	free(o->filename);
 	free(o->filename_format);
 	free(o->opendir);
@@ -65,6 +66,7 @@ void convert_thread_options_to_cpu(struct thread_options *o,
 	string_to_cpu(&o->name, top->name);
 	string_to_cpu(&o->wait_for, top->wait_for);
 	string_to_cpu(&o->directory, top->directory);
+	string_to_cpu(&o->verify_track_dir, top->verify_track_dir);
 	string_to_cpu(&o->filename, top->filename);
 	string_to_cpu(&o->filename_format, top->filename_format);
 	string_to_cpu(&o->opendir, top->opendir);
@@ -172,6 +174,10 @@ void convert_thread_options_to_cpu(struct thread_options *o,
 	o->verify_dump = le32_to_cpu(top->verify_dump);
 	o->verify_async = le32_to_cpu(top->verify_async);
 	o->verify_batch = le32_to_cpu(top->verify_batch);
+	o->verify_track = le32_to_cpu(top->verify_track);
+	o->verify_track_log = le32_to_cpu(top->verify_track_log);
+	o->verify_track_required = le32_to_cpu(top->verify_track_required);
+	o->verify_track_trim_zero = le32_to_cpu(top->verify_track_trim_zero);
 	o->use_thread = le32_to_cpu(top->use_thread);
 	o->unlink = le32_to_cpu(top->unlink);
 	o->unlink_each_loop = le32_to_cpu(top->unlink_each_loop);
@@ -314,6 +320,7 @@ void convert_thread_options_to_net(struct thread_options_pack *top,
 	string_to_net(top->name, o->name);
 	string_to_net(top->wait_for, o->wait_for);
 	string_to_net(top->directory, o->directory);
+	string_to_net(top->verify_track_dir, o->verify_track_dir);
 	string_to_net(top->filename, o->filename);
 	string_to_net(top->filename_format, o->filename_format);
 	string_to_net(top->opendir, o->opendir);
@@ -376,6 +383,10 @@ void convert_thread_options_to_net(struct thread_options_pack *top,
 	top->verify_dump = cpu_to_le32(o->verify_dump);
 	top->verify_async = cpu_to_le32(o->verify_async);
 	top->verify_batch = cpu_to_le32(o->verify_batch);
+	top->verify_track = cpu_to_le32(o->verify_track);
+	top->verify_track_log = cpu_to_le32(o->verify_track_log);
+	top->verify_track_required = cpu_to_le32(o->verify_track_required);
+	top->verify_track_trim_zero = cpu_to_le32(o->verify_track_trim_zero);
 	top->use_thread = cpu_to_le32(o->use_thread);
 	top->unlink = cpu_to_le32(o->unlink);
 	top->unlink_each_loop = cpu_to_le32(o->unlink_each_loop);

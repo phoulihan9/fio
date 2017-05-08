@@ -63,8 +63,17 @@ uint64_t usec_sleep(struct thread_data *td, unsigned long usec)
 		req.tv_nsec = ts * 1000;
 		fio_gettime(&tv, NULL);
 
-		if (nanosleep(&req, NULL) < 0)
+		if (req.tv_sec) {
+			if (sleep(req.tv_sec) != 0)
 			break;
+		}
+		if (ts) {
+			if (usleep(ts) < 0)
+			break;
+		}
+		// nanosleep was hanging on Windows 7 so replaced
+		//if (nanosleep(&req, NULL) < 0)
+		//	break;
 
 		ts = utime_since_now(&tv);
 		t += ts;

@@ -116,6 +116,11 @@ struct thread_options {
 	unsigned int verify_async;
 	unsigned long long verify_backlog;
 	unsigned int verify_batch;
+	unsigned int verify_track;
+	unsigned int verify_track_log;
+	unsigned int verify_track_required;
+	char *verify_track_dir;
+	unsigned int verify_track_trim_zero;
 	unsigned int experimental_verify;
 	unsigned int verify_state;
 	unsigned int verify_state_save;
@@ -149,6 +154,7 @@ struct thread_options {
 
 	struct zone_split *zone_split[DDIR_RWDIR_CNT];
 	unsigned int zone_split_nr[DDIR_RWDIR_CNT];
+	//unsigned int pad;
 
 	fio_fp64_t zipf_theta;
 	fio_fp64_t pareto_h;
@@ -386,6 +392,11 @@ struct thread_options_pack {
 	uint32_t verify_async;
 	uint64_t verify_backlog;
 	uint32_t verify_batch;
+	uint32_t verify_track;
+	uint32_t verify_track_log;
+	uint32_t verify_track_required;
+	uint8_t verify_track_dir[FIO_TOP_STR_MAX];
+	uint32_t verify_track_trim_zero;
 	uint32_t experimental_verify;
 	uint32_t verify_state;
 	uint32_t verify_state_save;
